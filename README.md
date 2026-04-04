@@ -1,8 +1,6 @@
 # arxiv-tex-extract
 
-Experimental Rust utility for extracting plain text from arXiv LaTeX source archives. Processes nested `.tar` / `.tar.gz` archives containing LaTeX papers, converts them to clean readable text, and writes results to Parquet, JSONL, or individual text files.
-
-Built to handle the full arXiv bulk source corpus — millions of papers across thousands of archive files — with parallel processing, per-document timeouts, crash-safe checkpointing, and automatic output sharding.
+Experimental Rust utility for extracting plain text from arXiv LaTeX source archives. Processes nested `.tar` / `.tar.gz` archives containing LaTeX papers, converts them to text, and writes results to Parquet, JSONL, or individual text files.
 
 
 ## Installation
