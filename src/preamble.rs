@@ -14,7 +14,7 @@ pub fn extract_preamble_extras(file_content: &str) -> Vec<String> {
     };
 
     let preamble = &file_content[..doc_start];
-    let commands = ["\\thanks", "\\footnote", "\\footnotetext"];
+    let commands = ["\\thanks", "\\footnote", "\\footnotetext", "\\funding"];
 
     for cmd in &commands {
         let mut search_start = 0;
@@ -117,7 +117,7 @@ fn extract_preamble_extras_excluding(
     };
 
     let preamble = &file_content[..doc_start];
-    let commands = ["\\thanks", "\\footnote", "\\footnotetext"];
+    let commands = ["\\thanks", "\\footnote", "\\footnotetext", "\\funding"];
 
     for cmd in &commands {
         let mut search_start = 0;
@@ -557,6 +557,23 @@ fn extract_braced_after(text: &str, pos: usize) -> Option<(usize, usize)> {
     }
 }
 
+/// Find `\end{document}` that is NOT inside a LaTeX comment (line starting with `%`).
+fn find_end_document(text: &str) -> Option<usize> {
+    let target = "\\end{document}";
+    let mut search_start = 0;
+    while let Some(pos) = text[search_start..].find(target) {
+        let abs_pos = search_start + pos;
+        // Walk backward to the start of the line
+        let line_start = text[..abs_pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let before = text[line_start..abs_pos].trim_start();
+        if !before.starts_with('%') {
+            return Some(abs_pos);
+        }
+        search_start = abs_pos + target.len();
+    }
+    None
+}
+
 /// Extract the document body between \begin{document} and \end{document}.
 /// Returns (preamble_extras, body). If no \begin{document} is found, returns
 /// the entire content as the body.
@@ -571,7 +588,7 @@ pub fn extract_body(file_content: &str) -> (Vec<String>, String) {
 
     let body = if let Some(start) = file_content.find("\\begin{document}") {
         let after_begin = start + "\\begin{document}".len();
-        if let Some(end) = file_content[after_begin..].find("\\end{document}") {
+        if let Some(end) = find_end_document(&file_content[after_begin..]) {
             file_content[after_begin..after_begin + end].to_string()
         } else {
             file_content[after_begin..].to_string()
@@ -728,5 +745,43 @@ mod tests {
                 "institute and-split Dept A missing: {extras:?}");
         assert!(extras.iter().any(|e| e.contains("Dept B")),
                 "institute and-split Dept B missing: {extras:?}");
+    }
+
+    #[test]
+    fn test_commented_end_document_skipped() {
+        let input = "\\begin{document}before\n%\\end{document}\nafter\\end{document}";
+        let (_, body) = extract_body(input);
+        assert!(body.contains("before"), "body should contain text before commented end: {body:?}");
+        assert!(body.contains("after"), "body should contain text after commented end: {body:?}");
+    }
+
+    #[test]
+    fn test_uncommented_end_document_unchanged() {
+        let input = r"\begin{document}hello world\end{document}";
+        let (_, body) = extract_body(input);
+        assert_eq!(body, "hello world");
+    }
+
+    #[test]
+    fn test_text_before_percent_on_same_line() {
+        // % after non-comment text on the same line — \end{document} is still valid
+        let input = "\\begin{document}body text % comment\n\\end{document}\nextra";
+        let (_, body) = extract_body(input);
+        assert_eq!(body, "body text % comment\n");
+    }
+
+    #[test]
+    fn test_preamble_funding_extracted() {
+        let input = r"\funding{Supported by grant X}\begin{document}body\end{document}";
+        let extras = extract_preamble_extras(input);
+        assert_eq!(extras, vec!["Supported by grant X"]);
+    }
+
+    #[test]
+    fn test_preamble_funding_in_body_extraction() {
+        let input = r"\funding{Partly supported by ANR FREDDA}\begin{document}body\end{document}";
+        let (extras, _) = extract_body(input);
+        assert!(extras.iter().any(|e| e.contains("ANR FREDDA")),
+                "funding missing from extras: {extras:?}");
     }
 }
