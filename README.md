@@ -108,18 +108,61 @@ Each extracted paper produces one record with these fields:
 
 Parquet output is automatically split into shards when either the row count or byte estimate exceeds the configured limits. Shard files are named `{stem}.parquet`, `{stem}_001.parquet`, `{stem}_002.parquet`, etc. All shards use zstd compression (level 3) and are written atomically via temp-file-then-rename.
 
+### Error categorization
+
+Extraction outcomes are classified into fine-grained categories rather than a single "error" bucket:
+
+| Status | Meaning |
+|--------|---------|
+| `ok` | Successful extraction |
+| `empty` | No `.tex` files found, or extraction produced no text |
+| `skipped` | Combined `.tex` content exceeds 10 MB limit |
+| `timeout` | Per-document extraction timeout fired |
+| `panic` | Extraction pipeline panicked (caught by `catch_unwind`) |
+| `crash` | Extraction thread disconnected unexpectedly |
+| `archive_error` | Tar entry, archive load, or decompression failure |
+| `io_error` | Failed to write output (Parquet, JSONL, or text file) |
+
+Each error is logged with a structured `category` field for easy filtering:
+
+```bash
+# Show only panics
+RUST_LOG=info latex-extract ... 2>&1 | grep 'category=panic'
+
+# Show only archive failures
+RUST_LOG=info latex-extract ... 2>&1 | grep 'category=archive'
+```
+
+The summary log shows a breakdown with sample IDs for non-zero categories:
+
+```
+Done: 50 tars, 125000 papers (123500 ok)
+  200 timeouts (e.g. 2401.00100, 2401.00200, 2401.00300, 2401.00400, 2401.00500)
+  400 skipped (e.g. 2401.10000, 2401.10001)
+  150 panics (e.g. 2401.00001, 2401.00523, 2401.01234)
+  130 archive errors (e.g. hep-ph/0001001, hep-ph/0001002)
+  100 empty
+  20 crashes (e.g. 2401.99999)
+  12 I/O write errors
+```
+
 ### Metrics sidecar
 
 When `--metrics` is enabled, each processed tar produces a JSON file like:
 
 ```json
 {
-  "tar": "arXiv_src_0001.tar",
-  "total": 500,
-  "ok": 487,
-  "error": 11,
-  "timeout": 2,
-  "elapsed_secs": 42.7
+  "tar_name": "arXiv_src_0712.tar",
+  "total_papers": 5000,
+  "ok": 4850,
+  "empty": 60,
+  "skipped": 40,
+  "timeouts": 20,
+  "panics": 15,
+  "crashes": 2,
+  "archive_errors": 13,
+  "io_errors": 0,
+  "processing_time_ms": 45000
 }
 ```
 
