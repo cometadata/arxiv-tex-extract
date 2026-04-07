@@ -62,21 +62,33 @@ pub fn iter_papers(reader: impl Read) -> Vec<Result<PaperArchive>> {
 
 /// Process a single entry from the outer tar.
 fn process_entry<R: Read>(mut entry: tar::Entry<R>, arxiv_id: &str, path: &str) -> Result<PaperArchive> {
+    // Guard: skip entries whose raw size already exceeds the decompression
+    // limit. Prevents reading huge compressed blobs into memory.
+    let raw_size = entry.header().size().unwrap_or(0);
+    if raw_size > MAX_DECOMPRESSED_SIZE {
+        anyhow::bail!(
+            "entry {} raw size ({} bytes) exceeds {}MB limit",
+            path,
+            raw_size,
+            MAX_DECOMPRESSED_SIZE / 1_000_000
+        );
+    }
+
     let mut raw_bytes = Vec::new();
     entry
         .read_to_end(&mut raw_bytes)
         .with_context(|| format!("reading entry {}", path))?;
 
-    let tex_files = if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
+    let tex_files = if path.ends_with(".tar.gz") || path.ends_with(".tgz") || path.ends_with(".gz") {
         // Try as gzipped tar first. If that yields no .tex files, also try
         // as a single gzipped .tex — some arXiv .tar.gz entries are just
         // gzipped tex files that the tar crate silently returns zero entries for.
+        // Old arXiv .gz entries are often gzipped tar archives (multi-file
+        // submissions) despite the plain .gz extension.
         match extract_inner_tar_gz(&raw_bytes, arxiv_id) {
             Ok(files) if !files.is_empty() => files,
             _ => extract_single_gz(&raw_bytes, arxiv_id).unwrap_or_default(),
         }
-    } else if path.ends_with(".gz") {
-        extract_single_gz(&raw_bytes, arxiv_id)?
     } else if path.ends_with(".tex") {
         extract_single_tex(&raw_bytes, path)?
     } else {
@@ -207,7 +219,7 @@ pub fn load_paper_archive(file_path: &std::path::Path) -> Result<PaperArchive> {
 
     let path_str = file_path.to_string_lossy().to_string();
 
-    let tex_files = if path_str.ends_with(".tar.gz") || path_str.ends_with(".tgz") {
+    let tex_files = if path_str.ends_with(".tar.gz") || path_str.ends_with(".tgz") || path_str.ends_with(".gz") {
         match extract_from_tar(&raw, &arxiv_id) {
             Ok(files) if !files.is_empty() => files,
             _ => {
@@ -217,8 +229,6 @@ pub fn load_paper_archive(file_path: &std::path::Path) -> Result<PaperArchive> {
                 }
             }
         }
-    } else if path_str.ends_with(".gz") {
-        extract_single_gz(&raw, &arxiv_id)?
     } else if path_str.ends_with(".tex") {
         extract_single_tex(&raw, &path_str)?
     } else {

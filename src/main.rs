@@ -58,6 +58,10 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_MAX_TEX_BYTES)]
     max_tex_bytes: usize,
 
+    /// Maximum process memory (MB) before skipping entries (safety limit)
+    #[arg(long)]
+    max_memory_mb: Option<usize>,
+
     /// Write one .txt file per paper instead of structured output
     #[arg(long)]
     text_files: bool,
@@ -119,6 +123,19 @@ fn log_memory_stats() {
 #[cfg(target_env = "msvc")]
 fn log_memory_stats() {}
 
+/// Read jemalloc allocated bytes for memory pressure checks.
+#[cfg(not(target_env = "msvc"))]
+fn get_allocated_bytes() -> Option<usize> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().ok()?;
+    stats::allocated::read().ok()
+}
+
+#[cfg(target_env = "msvc")]
+fn get_allocated_bytes() -> Option<usize> {
+    None
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -133,6 +150,7 @@ fn main() -> Result<()> {
 
     let timeout = Duration::from_secs(args.timeout_secs);
     let max_tex_bytes = args.max_tex_bytes;
+    let max_memory_bytes: Option<usize> = args.max_memory_mb.map(|mb| mb * 1_048_576);
 
     let text_files = args.text_files;
 
@@ -144,16 +162,16 @@ fn main() -> Result<()> {
                 .output_dir
                 .as_ref()
                 .context("--output-dir is required when --input-file is a directory")?;
-            process_batch(input_file, output_dir, timeout, max_tex_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics)?;
+            process_batch(input_file, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics)?;
         } else {
-            process_single_file(input_file, timeout, max_tex_bytes, text_files)?;
+            process_single_file(input_file, timeout, max_tex_bytes, max_memory_bytes, text_files)?;
         }
     } else if let Some(input_dir) = &args.input_dir {
         let output_dir = args
             .output_dir
             .as_ref()
             .context("--output-dir is required in batch mode")?;
-        process_batch(input_dir, output_dir, timeout, max_tex_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics)?;
+        process_batch(input_dir, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics)?;
     } else {
         anyhow::bail!("Either --input-dir or --input-file must be specified");
     }
@@ -164,11 +182,11 @@ fn main() -> Result<()> {
 }
 
 /// Process a single archive file and print to stdout.
-fn process_single_file(input_file: &Path, timeout: Duration, max_tex_bytes: usize, text_files: bool) -> Result<()> {
+fn process_single_file(input_file: &Path, timeout: Duration, max_tex_bytes: usize, max_memory_bytes: Option<usize>, text_files: bool) -> Result<()> {
     let paper = archive::load_paper_archive(input_file)
         .with_context(|| format!("loading {}", input_file.display()))?;
 
-    let result = extract_with_timeout(&paper, None, timeout, max_tex_bytes);
+    let result = extract_with_timeout(&paper, None, timeout, max_tex_bytes, max_memory_bytes);
 
     if text_files {
         if let Some(text) = &result.text {
@@ -188,6 +206,7 @@ fn process_batch(
     output_dir: &Path,
     timeout: Duration,
     max_tex_bytes: usize,
+    max_memory_bytes: Option<usize>,
     text_files: bool,
     format: OutputFormat,
     max_shard_rows: usize,
@@ -228,14 +247,14 @@ fn process_batch(
             .filter(|p| p.extension().map_or(false, |e| e == "tar"))
             .collect();
         if text_files {
-            process_outer_tars_text(&tar_files, output_dir, timeout, max_tex_bytes)?;
+            process_outer_tars_text(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes)?;
         } else {
-            process_outer_tars(&tar_files, output_dir, timeout, max_tex_bytes, format, max_shard_rows, max_shard_bytes, resume, emit_metrics)?;
+            process_outer_tars(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, resume, emit_metrics)?;
         }
     } else if text_files {
-        process_individual_archives_text(&archive_files, output_dir, timeout, max_tex_bytes)?;
+        process_individual_archives_text(&archive_files, output_dir, timeout, max_tex_bytes, max_memory_bytes)?;
     } else {
-        process_individual_archives(&archive_files, output_dir, timeout, max_tex_bytes, format, max_shard_rows, max_shard_bytes, emit_metrics)?;
+        process_individual_archives(&archive_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, emit_metrics)?;
     }
 
     Ok(())
@@ -247,6 +266,7 @@ fn process_outer_tars(
     output_dir: &Path,
     timeout: Duration,
     max_tex_bytes: usize,
+    max_memory_bytes: Option<usize>,
     format: OutputFormat,
     max_shard_rows: usize,
     max_shard_bytes: usize,
@@ -296,7 +316,7 @@ fn process_outer_tars(
     let cp_path = checkpoint_path.clone();
 
     pending.par_iter().for_each(|tar_path| {
-        match process_outer_tar(tar_path, output_dir, timeout, max_tex_bytes, format, max_shard_rows, max_shard_bytes, emit_metrics) {
+        match process_outer_tar(tar_path, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, emit_metrics) {
             Ok(tar_counts) => {
                 counts.lock().unwrap().merge(&tar_counts);
 
@@ -333,6 +353,7 @@ fn process_individual_archives(
     output_dir: &Path,
     timeout: Duration,
     max_tex_bytes: usize,
+    max_memory_bytes: Option<usize>,
     format: OutputFormat,
     max_shard_rows: usize,
     max_shard_bytes: usize,
@@ -394,7 +415,7 @@ fn process_individual_archives(
     files.par_iter().for_each_with(tx, |tx, path| {
         let result = match archive::load_paper_archive(path) {
             Ok(paper) => {
-                let result = extract_with_timeout(&paper, None, timeout, max_tex_bytes);
+                let result = extract_with_timeout(&paper, None, timeout, max_tex_bytes, max_memory_bytes);
                 counts_ref.lock().unwrap().record(classify_result(&result), &result.arxiv_id);
                 result
             }
@@ -468,6 +489,7 @@ fn process_individual_archives_text(
     output_dir: &Path,
     timeout: Duration,
     max_tex_bytes: usize,
+    max_memory_bytes: Option<usize>,
 ) -> Result<()> {
     let progress = ProgressBar::new(files.len() as u64);
     progress.set_style(
@@ -482,7 +504,7 @@ fn process_individual_archives_text(
         let mut local_counts = StatusCounts::default();
         match archive::load_paper_archive(path) {
             Ok(paper) => {
-                let result = extract_with_timeout(&paper, None, timeout, max_tex_bytes);
+                let result = extract_with_timeout(&paper, None, timeout, max_tex_bytes, max_memory_bytes);
                 let outcome = classify_result(&result);
                 if let Some(text) = &result.text {
                     let out_path = output_dir.join(format!("{}.txt", output_stem(path)));
@@ -521,6 +543,7 @@ fn process_outer_tars_text(
     output_dir: &Path,
     timeout: Duration,
     max_tex_bytes: usize,
+    max_memory_bytes: Option<usize>,
 ) -> Result<()> {
     let pending: Vec<&PathBuf> = tar_files.iter().collect();
 
@@ -538,7 +561,7 @@ fn process_outer_tars_text(
     let output_dir_owned = output_dir.to_path_buf();
 
     pending.par_iter().for_each(|tar_path| {
-        match process_outer_tar_text(tar_path, &output_dir_owned, timeout, max_tex_bytes) {
+        match process_outer_tar_text(tar_path, &output_dir_owned, timeout, max_tex_bytes, max_memory_bytes) {
             Ok(tar_counts) => {
                 counts.lock().unwrap().merge(&tar_counts);
             }
@@ -570,6 +593,7 @@ fn process_outer_tar_text(
     output_dir: &Path,
     timeout: Duration,
     max_tex_bytes: usize,
+    max_memory_bytes: Option<usize>,
 ) -> Result<StatusCounts> {
     let source_tar = tar_path
         .file_name()
@@ -588,7 +612,7 @@ fn process_outer_tar_text(
     archive::for_each_paper(file, |paper_result| {
         match paper_result {
             Ok(paper) => {
-                let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes);
+                let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
                 let outcome = classify_result(&result);
                 if let Some(text) = &result.text {
                     let out_path =
@@ -616,6 +640,7 @@ fn process_outer_tar(
     output_dir: &Path,
     timeout: Duration,
     max_tex_bytes: usize,
+    max_memory_bytes: Option<usize>,
     format: OutputFormat,
     max_shard_rows: usize,
     max_shard_bytes: usize,
@@ -645,7 +670,7 @@ fn process_outer_tar(
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
                     Ok(paper) => {
-                        let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes);
+                        let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
                         counts.record(classify_result(&result), &result.arxiv_id);
                         if let Err(e) = writer.write(result) {
                             error!(category = "io", tar = %stem, "parquet write error: {}", e);
@@ -672,7 +697,7 @@ fn process_outer_tar(
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
                     Ok(paper) => {
-                        let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes);
+                        let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
                         counts.record(classify_result(&result), &result.arxiv_id);
                         if let Err(e) = serde_json::to_writer(&mut writer, &result) {
                             error!(category = "io", tar = %stem, "JSON write error: {}", e);
@@ -733,6 +758,7 @@ fn extract_with_timeout(
     source_tar: Option<&str>,
     timeout: Duration,
     max_tex_bytes: usize,
+    max_memory_bytes: Option<usize>,
 ) -> ExtractionResult {
     let num_files = paper.tex_files.len();
 
@@ -760,6 +786,37 @@ fn extract_with_timeout(
             total_time_us: None,
             peak_memory_bytes: None,
         };
+    }
+
+    // Memory pressure guard: skip if process is above the configured limit.
+    if let Some(max_memory) = max_memory_bytes {
+        if let Some(allocated) = get_allocated_bytes() {
+            if allocated > max_memory {
+                warn!(
+                    category = "skipped",
+                    arxiv_id = %paper.arxiv_id,
+                    "memory pressure: {:.1}MB allocated exceeds {:.1}MB limit",
+                    allocated as f64 / 1_048_576.0,
+                    max_memory as f64 / 1_048_576.0,
+                );
+                return ExtractionResult {
+                    arxiv_id: paper.arxiv_id.clone(),
+                    source_tar: source_tar.map(|s| s.to_string()),
+                    status: "skipped".into(),
+                    num_tex_files: Some(num_files),
+                    text_length: None,
+                    text: None,
+                    error: Some(format!(
+                        "memory pressure: {:.1}MB allocated exceeds {:.1}MB limit",
+                        allocated as f64 / 1_048_576.0,
+                        max_memory as f64 / 1_048_576.0,
+                    )),
+                    stage_timings_us: None,
+                    total_time_us: None,
+                    peak_memory_bytes: None,
+                };
+            }
+        }
     }
 
     // Clone data for the spawned thread (thread::spawn requires 'static)
@@ -921,7 +978,7 @@ mod tests {
                 content: large_content,
             }],
         };
-        let result = extract_with_timeout(&paper, None, Duration::from_secs(5), DEFAULT_MAX_TEX_BYTES);
+        let result = extract_with_timeout(&paper, None, Duration::from_secs(5), DEFAULT_MAX_TEX_BYTES, None);
         assert_eq!(result.status, "skipped");
         assert!(result.error.unwrap().contains("exceeds"));
     }
@@ -937,7 +994,7 @@ mod tests {
             }],
         };
         // 100 bytes exceeds a 50-byte custom limit
-        let result = extract_with_timeout(&paper, None, Duration::from_secs(5), 50);
+        let result = extract_with_timeout(&paper, None, Duration::from_secs(5), 50, None);
         assert_eq!(result.status, "skipped");
 
         // Same content passes with a larger limit
@@ -948,7 +1005,7 @@ mod tests {
                 content,
             }],
         };
-        let result2 = extract_with_timeout(&paper2, None, Duration::from_secs(5), 200);
+        let result2 = extract_with_timeout(&paper2, None, Duration::from_secs(5), 200, None);
         assert_ne!(result2.status, "skipped");
     }
 
@@ -967,7 +1024,7 @@ mod tests {
             }],
         };
         // Duration::ZERO means recv_timeout returns immediately
-        let result = extract_with_timeout(&paper, None, Duration::ZERO, DEFAULT_MAX_TEX_BYTES);
+        let result = extract_with_timeout(&paper, None, Duration::ZERO, DEFAULT_MAX_TEX_BYTES, None);
         // With zero timeout, we get either timeout or the result (race),
         // but the mechanism is exercised either way.
         assert!(result.status == "timeout" || result.status == "ok");
@@ -987,7 +1044,7 @@ Hello world.
                     .into(),
             }],
         };
-        let result = extract_with_timeout(&paper, Some("test.tar"), Duration::from_secs(5), DEFAULT_MAX_TEX_BYTES);
+        let result = extract_with_timeout(&paper, Some("test.tar"), Duration::from_secs(5), DEFAULT_MAX_TEX_BYTES, None);
         assert_eq!(result.status, "ok");
         assert!(result.text.unwrap().contains("Hello world."));
         assert_eq!(result.source_tar.unwrap(), "test.tar");
@@ -1006,7 +1063,7 @@ Hello.
                     .into(),
             }],
         };
-        let result = extract_with_timeout(&paper, None, Duration::from_secs(5), DEFAULT_MAX_TEX_BYTES);
+        let result = extract_with_timeout(&paper, None, Duration::from_secs(5), DEFAULT_MAX_TEX_BYTES, None);
         assert_eq!(result.status, "ok");
         assert!(result.stage_timings_us.is_some(), "should have stage timings");
         assert!(result.total_time_us.is_some(), "should have total time");
