@@ -157,18 +157,27 @@ fn skip_ws_bytes(bytes: &[u8], pos: usize) -> usize {
     i
 }
 
+/// Size threshold (5MB) above which macro expansion uses fewer iterations
+/// to limit worst-case scanning on large inputs.
+const LARGE_INPUT_THRESHOLD: usize = 5_000_000;
+
 /// Safely expand macros using Aho-Corasick single-pass replacement.
-/// Iterates up to 5 times to resolve multi-level macro chains (e.g. \foo → \bar → "final").
+///
+/// Iterates up to `max_passes` times to resolve multi-level macro chains
+/// (e.g. \foo -> \bar -> "final"). For inputs above 5MB, the cap is reduced
+/// from 5 to 3 passes to limit worst-case scanning.
 pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
     if macros.is_empty() {
         return text.to_string();
     }
 
+    let max_passes = if text.len() > LARGE_INPUT_THRESHOLD { 3 } else { 5 };
+
     let pairs: Vec<(&str, &str)> = macros.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let replacer = CommandReplacer::new(&pairs);
 
     let mut result = text.to_string();
-    for _ in 0..5 {
+    for _ in 0..max_passes {
         let next = replacer.replace_all(&result);
         if next == result {
             break;
@@ -271,5 +280,23 @@ mod tests {
         macros.insert("\\bbb".to_string(), "\\ccc".to_string());
         macros.insert("\\ccc".to_string(), "done".to_string());
         assert_eq!(expand_macros("\\aaa", &macros), "done");
+    }
+
+    #[test]
+    fn test_expand_macros_large_input_cap() {
+        let mut macros = HashMap::new();
+        macros.insert("\\aaa".to_string(), "\\bbb".to_string());
+        macros.insert("\\bbb".to_string(), "\\ccc".to_string());
+        macros.insert("\\ccc".to_string(), "done".to_string());
+
+        // Input above LARGE_INPUT_THRESHOLD still resolves a 3-level chain
+        let mut large_input = "x".repeat(LARGE_INPUT_THRESHOLD + 1);
+        large_input.push_str("\\aaa");
+
+        let result = expand_macros(&large_input, &macros);
+        assert!(
+            result.ends_with("done"),
+            "3-level chain should resolve with 3 passes on large input"
+        );
     }
 }
