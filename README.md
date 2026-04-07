@@ -77,7 +77,8 @@ latex-extract \
 | `-f, --input-file <PATH>` | Single archive file (`.tar.gz`, `.gz`, or `.tex`) | — |
 | `-o, --output-dir <PATH>` | Output directory (required for batch mode) | — |
 | `-j, --threads <N>` | Worker threads | number of CPUs |
-| `-t, --timeout-secs <N>` | Per-document extraction timeout | `30` |
+| `-t, --timeout-secs <N>` | Per-document extraction timeout | `45` |
+| `--max-tex-bytes <N>` | Max combined `.tex` content before skipping | `20000000` (20 MB) |
 | `--text-files` | Write one `.txt` per paper instead of structured output | off |
 | `--output-format <FMT>` | `parquet` or `jsonl` | `parquet` |
 | `--max-shard-rows <N>` | Max rows per Parquet shard | `10000` |
@@ -116,7 +117,7 @@ Extraction outcomes are classified into fine-grained categories rather than a si
 |--------|---------|
 | `ok` | Successful extraction |
 | `empty` | No `.tex` files found, or extraction produced no text |
-| `skipped` | Combined `.tex` content exceeds 10 MB limit |
+| `skipped` | Combined `.tex` content exceeds size limit (default 20 MB) |
 | `timeout` | Per-document extraction timeout fired |
 | `panic` | Extraction pipeline panicked (caught by `catch_unwind`) |
 | `crash` | Extraction thread disconnected unexpectedly |
@@ -190,9 +191,9 @@ LaTeX-to-text conversion is a multi-stage pipeline. Each stage is timed independ
 
 | Limit | Value | Rationale |
 |-------|-------|-----------|
-| Max combined `.tex` size | 10 MB | Prevents regex explosion (~100 MB intermediates across pipeline passes) |
+| Max combined `.tex` size | 20 MB (default, configurable via `--max-tex-bytes`) | Prevents regex explosion across pipeline passes |
 | Max decompressed entry | 100 MB | Guards against zip bombs |
-| Per-document timeout | 30 s (default) | Stuck documents are killed; worker threads are not blocked |
+| Per-document timeout | 45 s (default) | Stuck documents are killed; worker threads are not blocked |
 
 Documents exceeding the `.tex` size limit are reported with status `skipped`. Timed-out documents are reported with status `timeout`.
 

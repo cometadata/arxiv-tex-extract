@@ -16,7 +16,7 @@ pub enum Outcome {
     Ok,
     /// No tex files or extraction produced empty text
     Empty,
-    /// Combined .tex content exceeds 10MB limit
+    /// Combined .tex content exceeds size limit
     Skipped,
     /// Per-document extraction timeout
     Timeout,
