@@ -123,7 +123,12 @@ fn extract_inner_tar_gz(raw: &[u8], arxiv_id: &str) -> Result<Vec<TexFile>> {
             Err(_) => continue,
         };
 
-        if !entry_path.ends_with(".tex") && !entry_path.ends_with(".bbl") {
+        let lower = entry_path.to_ascii_lowercase();
+        if !lower.ends_with(".tex")
+            && !lower.ends_with(".bbl")
+            && !lower.ends_with(".ltx")
+            && !lower.ends_with(".latex")
+        {
             continue;
         }
 
@@ -247,7 +252,12 @@ fn extract_from_tar(raw: &[u8], _arxiv_id: &str) -> Result<Vec<TexFile>> {
         let mut entry = entry_result?;
         let path = entry.path()?.to_string_lossy().to_string();
 
-        if !path.ends_with(".tex") && !path.ends_with(".bbl") {
+        let lower = path.to_ascii_lowercase();
+        if !lower.ends_with(".tex")
+            && !lower.ends_with(".bbl")
+            && !lower.ends_with(".ltx")
+            && !lower.ends_with(".latex")
+        {
             continue;
         }
 
