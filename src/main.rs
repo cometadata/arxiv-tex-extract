@@ -438,6 +438,8 @@ fn process_individual_archives(
                     stage_timings_us: None,
                     total_time_us: None,
                     peak_memory_bytes: None,
+                    file_type: None,
+                    entry_name: None,
                 }
             }
         };
@@ -785,6 +787,8 @@ fn extract_with_timeout(
             stage_timings_us: None,
             total_time_us: None,
             peak_memory_bytes: None,
+            file_type: Some(paper.file_type),
+            entry_name: Some(paper.entry_name.clone()),
         };
     }
 
@@ -814,6 +818,8 @@ fn extract_with_timeout(
                     stage_timings_us: None,
                     total_time_us: None,
                     peak_memory_bytes: None,
+                    file_type: Some(paper.file_type),
+                    entry_name: Some(paper.entry_name.clone()),
                 };
             }
         }
@@ -822,6 +828,8 @@ fn extract_with_timeout(
     // Clone data for the spawned thread (thread::spawn requires 'static)
     let tex_files = paper.tex_files.clone();
     let arxiv_id = paper.arxiv_id.clone();
+    let file_type = paper.file_type;
+    let entry_name = paper.entry_name.clone();
     let source_tar_owned = source_tar.map(|s| s.to_string());
 
     let (tx, rx) = mpsc::channel();
@@ -830,6 +838,8 @@ fn extract_with_timeout(
         let paper = PaperArchive {
             arxiv_id,
             tex_files,
+            file_type,
+            entry_name,
         };
         let result = process_paper(&paper, source_tar_owned.as_deref());
         let _ = tx.send(result);
@@ -858,6 +868,8 @@ fn extract_with_timeout(
                 stage_timings_us: None,
                 total_time_us: None,
                 peak_memory_bytes: None,
+                file_type: Some(paper.file_type),
+                entry_name: Some(paper.entry_name.clone()),
             }
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -877,6 +889,8 @@ fn extract_with_timeout(
                 stage_timings_us: None,
                 total_time_us: None,
                 peak_memory_bytes: None,
+                file_type: Some(paper.file_type),
+                entry_name: Some(paper.entry_name.clone()),
             }
         }
     }
@@ -896,6 +910,8 @@ fn process_paper(paper: &PaperArchive, source_tar: Option<&str>) -> ExtractionRe
             stage_timings_us: None,
             total_time_us: None,
             peak_memory_bytes: None,
+            file_type: Some(paper.file_type),
+            entry_name: Some(paper.entry_name.clone()),
         };
     }
 
@@ -919,6 +935,8 @@ fn process_paper(paper: &PaperArchive, source_tar: Option<&str>) -> ExtractionRe
                 stage_timings_us: Some(output.timings.to_json()),
                 total_time_us: Some(output.timings.total_us()),
                 peak_memory_bytes: None,
+                file_type: Some(paper.file_type),
+                entry_name: Some(paper.entry_name.clone()),
             },
             None => ExtractionResult {
                 arxiv_id: paper.arxiv_id.clone(),
@@ -931,6 +949,8 @@ fn process_paper(paper: &PaperArchive, source_tar: Option<&str>) -> ExtractionRe
                 stage_timings_us: Some(output.timings.to_json()),
                 total_time_us: Some(output.timings.total_us()),
                 peak_memory_bytes: None,
+                file_type: Some(paper.file_type),
+                entry_name: Some(paper.entry_name.clone()),
             },
         },
         Err(panic_info) => {
@@ -958,6 +978,8 @@ fn process_paper(paper: &PaperArchive, source_tar: Option<&str>) -> ExtractionRe
                 stage_timings_us: None,
                 total_time_us: None,
                 peak_memory_bytes: None,
+                file_type: Some(paper.file_type),
+                entry_name: Some(paper.entry_name.clone()),
             }
         }
     }
@@ -967,6 +989,7 @@ fn process_paper(paper: &PaperArchive, source_tar: Option<&str>) -> ExtractionRe
 mod tests {
     use super::*;
     use latex_extract::input_resolve::TexFile;
+    use latex_extract::result::FileType;
 
     #[test]
     fn test_content_size_cap() {
@@ -977,6 +1000,8 @@ mod tests {
                 name: "main.tex".into(),
                 content: large_content,
             }],
+            file_type: FileType::Tex,
+            entry_name: "test.gz".into(),
         };
         let result = extract_with_timeout(&paper, None, Duration::from_secs(5), DEFAULT_MAX_TEX_BYTES, None);
         assert_eq!(result.status, "skipped");
@@ -992,6 +1017,8 @@ mod tests {
                 name: "main.tex".into(),
                 content: content.clone(),
             }],
+            file_type: FileType::Tex,
+            entry_name: "test.gz".into(),
         };
         // 100 bytes exceeds a 50-byte custom limit
         let result = extract_with_timeout(&paper, None, Duration::from_secs(5), 50, None);
@@ -1004,6 +1031,8 @@ mod tests {
                 name: "main.tex".into(),
                 content,
             }],
+            file_type: FileType::Tex,
+            entry_name: "test.gz".into(),
         };
         let result2 = extract_with_timeout(&paper2, None, Duration::from_secs(5), 200, None);
         assert_ne!(result2.status, "skipped");
@@ -1022,6 +1051,8 @@ mod tests {
                 name: "main.tex".into(),
                 content: r"\documentclass{article}\begin{document}Hello\end{document}".into(),
             }],
+            file_type: FileType::Tex,
+            entry_name: "test.gz".into(),
         };
         // Duration::ZERO means recv_timeout returns immediately
         let result = extract_with_timeout(&paper, None, Duration::ZERO, DEFAULT_MAX_TEX_BYTES, None);
@@ -1043,6 +1074,8 @@ Hello world.
 \end{document}"
                     .into(),
             }],
+            file_type: FileType::Tex,
+            entry_name: "test.gz".into(),
         };
         let result = extract_with_timeout(&paper, Some("test.tar"), Duration::from_secs(5), DEFAULT_MAX_TEX_BYTES, None);
         assert_eq!(result.status, "ok");
@@ -1062,6 +1095,8 @@ Hello.
 \end{document}"
                     .into(),
             }],
+            file_type: FileType::Tex,
+            entry_name: "test.gz".into(),
         };
         let result = extract_with_timeout(&paper, None, Duration::from_secs(5), DEFAULT_MAX_TEX_BYTES, None);
         assert_eq!(result.status, "ok");
@@ -1086,6 +1121,8 @@ Hello.
             stage_timings_us: None,
             total_time_us: None,
             peak_memory_bytes: None,
+            file_type: None,
+            entry_name: None,
         };
 
         assert_eq!(classify_result(&make("ok", None)), Outcome::Ok);
