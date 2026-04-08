@@ -1,4 +1,4 @@
-use crate::braces::find_braced_group;
+use crate::braces::{extract_command_arg, extract_optional_arg, find_braced_group};
 use crate::symbols::CommandReplacer;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -26,7 +26,7 @@ static PROTECTED_MACROS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 });
 
 static NEWCOMMAND_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\\(?:re)?newcommand\*?\{(\\[a-zA-Z]+)\}").unwrap());
+    LazyLock::new(|| Regex::new(r"\\(?:(?:re)?new|provide)command\*?\{(\\[a-zA-Z]+)\}").unwrap());
 
 static DEF_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\def\s*(\\[a-zA-Z]+)").unwrap());
@@ -82,6 +82,127 @@ pub fn collect_macros(file_content: &str) -> HashMap<String, String> {
             if !PROTECTED_MACROS.contains(name.as_str()) {
                 macros.insert(name, value);
             }
+        }
+    }
+
+    macros
+}
+
+/// A macro defined with an argument count, e.g. `\newcommand{\foo}[2]{#1 and #2}`.
+pub struct ParametricMacro {
+    pub name: String,
+    pub num_args: usize,
+    pub body: String,
+    pub optional_default: Option<String>,
+}
+
+/// Collect `\newcommand`, `\renewcommand`, `\providecommand`, and `\def` macros
+/// WITH arguments from a .tex file.
+///
+/// Returns parametric macros that take one or more arguments. These are the
+/// macros skipped by `collect_macros()`.
+pub fn collect_parametric_macros(file_content: &str) -> Vec<ParametricMacro> {
+    let mut macros = Vec::new();
+
+    for cap in NEWCOMMAND_RE.find_iter(file_content) {
+        let m = NEWCOMMAND_RE.captures(&file_content[cap.start()..]).unwrap();
+        let name = m.get(1).unwrap().as_str().to_string();
+        let after_name_close = cap.start() + m.get(0).unwrap().end();
+
+        if PROTECTED_MACROS.contains(name.as_str()) {
+            continue;
+        }
+
+        let bytes = file_content.as_bytes();
+        let mut pos = after_name_close;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+
+        // Must have [n] arg-count specifier (otherwise it's a simple macro)
+        if pos >= bytes.len() || bytes[pos] != b'[' {
+            continue;
+        }
+
+        if let Some((cs, ce, after_bracket)) = extract_optional_arg(file_content, pos) {
+            let num_str = file_content[cs..ce].trim();
+            let num_args: usize = match num_str.parse() {
+                Ok(n) if n > 0 && n <= 9 => n,
+                _ => continue,
+            };
+
+            pos = after_bracket;
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+
+            // Check for optional default value [default]
+            let optional_default = if pos < bytes.len() && bytes[pos] == b'[' {
+                if let Some((ds, de, after_default)) = extract_optional_arg(file_content, pos) {
+                    pos = after_default;
+                    Some(file_content[ds..de].to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some((bs, be)) = find_braced_group(file_content, pos) {
+                // Deduplicate: last definition wins (for \renewcommand)
+                macros.retain(|m: &ParametricMacro| m.name != name);
+                macros.push(ParametricMacro {
+                    name,
+                    num_args,
+                    body: file_content[bs..be].to_string(),
+                    optional_default,
+                });
+            }
+        }
+    }
+
+    // Handle \def\foo#1#2{body}
+    for cap in DEF_RE.find_iter(file_content) {
+        let m = DEF_RE.captures(&file_content[cap.start()..]).unwrap();
+        let name = m.get(1).unwrap().as_str().to_string();
+        let after_name = cap.start() + m.get(0).unwrap().end();
+
+        if PROTECTED_MACROS.contains(name.as_str()) {
+            continue;
+        }
+
+        let bytes = file_content.as_bytes();
+        let mut pos = after_name;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+
+        // Must have #n parameter pattern (otherwise it's a simple macro)
+        if pos >= bytes.len() || bytes[pos] != b'#' {
+            continue;
+        }
+
+        let mut num_args = 0usize;
+        while pos + 1 < bytes.len() && bytes[pos] == b'#' && bytes[pos + 1].is_ascii_digit() {
+            num_args += 1;
+            pos += 2;
+        }
+
+        if num_args == 0 || num_args > 9 {
+            continue;
+        }
+
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if let Some((bs, be)) = find_braced_group(file_content, pos) {
+            macros.retain(|m: &ParametricMacro| m.name != name);
+            macros.push(ParametricMacro {
+                name,
+                num_args,
+                body: file_content[bs..be].to_string(),
+                optional_default: None,
+            });
         }
     }
 
@@ -185,6 +306,139 @@ pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
         result = next;
     }
     result
+}
+
+/// Expand parametric macros by substituting `#1`, `#2`, etc. with extracted arguments.
+///
+/// Iterates up to 3 passes (2 for large inputs) to resolve nested parametric macros.
+pub fn expand_parametric_macros(text: &str, macros: &[ParametricMacro]) -> String {
+    if macros.is_empty() {
+        return text.to_string();
+    }
+
+    let max_passes = if text.len() > LARGE_INPUT_THRESHOLD { 2 } else { 3 };
+    let mut result = text.to_string();
+
+    for _ in 0..max_passes {
+        let prev = result.clone();
+        for mac in macros {
+            result = expand_single_parametric(&result, mac);
+        }
+        if result == prev {
+            break;
+        }
+    }
+
+    result
+}
+
+/// Expand all occurrences of a single parametric macro in the text.
+fn expand_single_parametric(text: &str, mac: &ParametricMacro) -> String {
+    let name = &mac.name;
+    let name_len = name.len();
+    let mut out = String::with_capacity(text.len());
+    let mut search_from = 0;
+
+    while let Some(rel_pos) = text[search_from..].find(name.as_str()) {
+        let abs_pos = search_from + rel_pos;
+        let after_name = abs_pos + name_len;
+
+        // Word boundary: next char must not be ASCII alphabetic
+        if after_name < text.len() && text.as_bytes()[after_name].is_ascii_alphabetic() {
+            out.push_str(&text[search_from..after_name]);
+            search_from = after_name;
+            continue;
+        }
+
+        // Copy text before the match
+        out.push_str(&text[search_from..abs_pos]);
+
+        if let Some((replacement, new_cursor)) = try_expand_parametric(text, after_name, mac) {
+            out.push_str(&replacement);
+            search_from = new_cursor;
+        } else {
+            // Could not extract required arguments; keep the command as-is
+            out.push_str(name);
+            search_from = after_name;
+        }
+    }
+
+    out.push_str(&text[search_from..]);
+    out
+}
+
+/// Try to extract arguments and expand a single parametric macro invocation.
+///
+/// Returns `Some((replacement, cursor_after))` on success, or `None` if
+/// the required number of braced arguments could not be extracted.
+fn try_expand_parametric(
+    text: &str,
+    start: usize,
+    mac: &ParametricMacro,
+) -> Option<(String, usize)> {
+    let mut cursor = start;
+    let mut arg_values: Vec<String> = Vec::with_capacity(mac.num_args);
+
+    if let Some(ref default) = mac.optional_default {
+        // First arg is optional with a default value
+        if let Some((cs, ce, after)) = extract_optional_arg(text, cursor) {
+            arg_values.push(text[cs..ce].to_string());
+            cursor = after;
+        } else {
+            arg_values.push(default.clone());
+        }
+        // Remaining args are mandatory
+        for _ in 0..mac.num_args - 1 {
+            let (cs, ce, after) = extract_command_arg(text, cursor)?;
+            arg_values.push(text[cs..ce].to_string());
+            cursor = after;
+        }
+    } else {
+        // All args are mandatory
+        for _ in 0..mac.num_args {
+            let (cs, ce, after) = extract_command_arg(text, cursor)?;
+            arg_values.push(text[cs..ce].to_string());
+            cursor = after;
+        }
+    }
+
+    let replacement = substitute_args(&mac.body, &arg_values);
+    Some((replacement, cursor))
+}
+
+/// Replace `#1`, `#2`, … placeholders in a macro body with argument values.
+///
+/// Handles `##` as an escaped literal `#`. All placeholders are substituted
+/// in a single pass to avoid interference between arguments.
+fn substitute_args(body: &str, args: &[String]) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'#' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'#' {
+                out.push('#');
+                i += 2;
+            } else if bytes[i + 1].is_ascii_digit() {
+                let n = (bytes[i + 1] - b'0') as usize;
+                if n >= 1 && n <= args.len() {
+                    out.push_str(&args[n - 1]);
+                }
+                // Out-of-range #N silently dropped (defensive for malformed macros)
+                i += 2;
+            } else {
+                out.push('#');
+                i += 1;
+            }
+        } else {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'#' {
+                i += 1;
+            }
+            out.push_str(&body[start..i]);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -298,5 +552,242 @@ mod tests {
             result.ends_with("done"),
             "3-level chain should resolve with 3 passes on large input"
         );
+    }
+
+    // --- providecommand support ---
+
+    #[test]
+    fn test_collect_providecommand() {
+        let input = r"\providecommand{\foo}{bar}";
+        let macros = collect_macros(input);
+        assert_eq!(macros.get("\\foo").unwrap(), "bar");
+    }
+
+    #[test]
+    fn test_collect_providecommand_star() {
+        let input = r"\providecommand*{\foo}{bar}";
+        let macros = collect_macros(input);
+        assert_eq!(macros.get("\\foo").unwrap(), "bar");
+    }
+
+    // --- parametric macro collection ---
+
+    #[test]
+    fn test_collect_parametric_newcommand() {
+        let input = r"\newcommand{\vect}[1]{\mathbf{#1}}";
+        let macros = collect_parametric_macros(input);
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].name, "\\vect");
+        assert_eq!(macros[0].num_args, 1);
+        assert_eq!(macros[0].body, "\\mathbf{#1}");
+        assert!(macros[0].optional_default.is_none());
+    }
+
+    #[test]
+    fn test_collect_parametric_two_args() {
+        let input = r"\newcommand{\inner}[2]{\langle #1, #2 \rangle}";
+        let macros = collect_parametric_macros(input);
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].num_args, 2);
+        assert_eq!(macros[0].body, "\\langle #1, #2 \\rangle");
+    }
+
+    #[test]
+    fn test_collect_parametric_with_optional_default() {
+        let input = r"\newcommand{\greet}[2][Hello]{#1, #2!}";
+        let macros = collect_parametric_macros(input);
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].num_args, 2);
+        assert_eq!(macros[0].optional_default.as_deref(), Some("Hello"));
+        assert_eq!(macros[0].body, "#1, #2!");
+    }
+
+    #[test]
+    fn test_collect_parametric_def() {
+        let input = r"\def\foo#1#2{#1 + #2}";
+        let macros = collect_parametric_macros(input);
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].name, "\\foo");
+        assert_eq!(macros[0].num_args, 2);
+        assert_eq!(macros[0].body, "#1 + #2");
+    }
+
+    #[test]
+    fn test_collect_parametric_skip_protected() {
+        let input = r"\newcommand{\section}[1]{custom #1}";
+        let macros = collect_parametric_macros(input);
+        assert!(macros.is_empty());
+    }
+
+    #[test]
+    fn test_collect_parametric_renewcommand_dedup() {
+        let input = r"\newcommand{\foo}[1]{first #1}
+\renewcommand{\foo}[1]{second #1}";
+        let macros = collect_parametric_macros(input);
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].body, "second #1");
+    }
+
+    #[test]
+    fn test_collect_parametric_providecommand() {
+        let input = r"\providecommand{\foo}[1]{provided #1}";
+        let macros = collect_parametric_macros(input);
+        assert_eq!(macros.len(), 1);
+        assert_eq!(macros[0].name, "\\foo");
+    }
+
+    #[test]
+    fn test_simple_macros_still_skip_parametric() {
+        let input = r"\newcommand{\foo}[1]{bar #1}";
+        let simple = collect_macros(input);
+        assert!(simple.is_empty(), "collect_macros should skip parametric");
+    }
+
+    // --- parametric macro expansion ---
+
+    #[test]
+    fn test_expand_parametric_single_arg() {
+        let macros = vec![ParametricMacro {
+            name: "\\vect".into(),
+            num_args: 1,
+            body: "\\mathbf{#1}".into(),
+            optional_default: None,
+        }];
+        let result = expand_parametric_macros("\\vect{x}", &macros);
+        assert_eq!(result, "\\mathbf{x}");
+    }
+
+    #[test]
+    fn test_expand_parametric_two_args() {
+        let macros = vec![ParametricMacro {
+            name: "\\foo".into(),
+            num_args: 2,
+            body: "#1 + #2".into(),
+            optional_default: None,
+        }];
+        let result = expand_parametric_macros("\\foo{a}{b}", &macros);
+        assert_eq!(result, "a + b");
+    }
+
+    #[test]
+    fn test_expand_parametric_with_default() {
+        let macros = vec![ParametricMacro {
+            name: "\\greet".into(),
+            num_args: 2,
+            body: "#1, #2!".into(),
+            optional_default: Some("Hello".into()),
+        }];
+        // Without optional arg: uses default
+        assert_eq!(
+            expand_parametric_macros("\\greet{World}", &macros),
+            "Hello, World!"
+        );
+        // With explicit optional arg
+        assert_eq!(
+            expand_parametric_macros("\\greet[Hi]{World}", &macros),
+            "Hi, World!"
+        );
+    }
+
+    #[test]
+    fn test_expand_parametric_word_boundary() {
+        let macros = vec![ParametricMacro {
+            name: "\\foo".into(),
+            num_args: 1,
+            body: "X".into(),
+            optional_default: None,
+        }];
+        // \foobar should NOT match \foo
+        assert_eq!(
+            expand_parametric_macros("\\foobar{x}", &macros),
+            "\\foobar{x}"
+        );
+    }
+
+    #[test]
+    fn test_expand_parametric_no_args_available() {
+        let macros = vec![ParametricMacro {
+            name: "\\foo".into(),
+            num_args: 1,
+            body: "#1".into(),
+            optional_default: None,
+        }];
+        // \foo without braced arg should be left as-is
+        assert_eq!(
+            expand_parametric_macros("\\foo is here", &macros),
+            "\\foo is here"
+        );
+    }
+
+    #[test]
+    fn test_expand_parametric_nested_braces() {
+        let macros = vec![ParametricMacro {
+            name: "\\wrap".into(),
+            num_args: 1,
+            body: "[#1]".into(),
+            optional_default: None,
+        }];
+        assert_eq!(
+            expand_parametric_macros("\\wrap{a {b} c}", &macros),
+            "[a {b} c]"
+        );
+    }
+
+    #[test]
+    fn test_expand_parametric_multiple_occurrences() {
+        let macros = vec![ParametricMacro {
+            name: "\\b".into(),
+            num_args: 1,
+            body: "**#1**".into(),
+            optional_default: None,
+        }];
+        assert_eq!(
+            expand_parametric_macros("\\b{x} and \\b{y}", &macros),
+            "**x** and **y**"
+        );
+    }
+
+    #[test]
+    fn test_expand_parametric_nested_macros() {
+        let macros = vec![
+            ParametricMacro {
+                name: "\\vect".into(),
+                num_args: 1,
+                body: "\\mathbf{#1}".into(),
+                optional_default: None,
+            },
+            ParametricMacro {
+                name: "\\inner".into(),
+                num_args: 2,
+                body: "\\langle #1, #2 \\rangle".into(),
+                optional_default: None,
+            },
+        ];
+        assert_eq!(
+            expand_parametric_macros("\\inner{\\vect{x}}{\\vect{y}}", &macros),
+            "\\langle \\mathbf{x}, \\mathbf{y} \\rangle"
+        );
+    }
+
+    #[test]
+    fn test_expand_parametric_escaped_hash() {
+        let macros = vec![ParametricMacro {
+            name: "\\foo".into(),
+            num_args: 1,
+            body: "#1 has a ## sign".into(),
+            optional_default: None,
+        }];
+        assert_eq!(
+            expand_parametric_macros("\\foo{test}", &macros),
+            "test has a # sign"
+        );
+    }
+
+    #[test]
+    fn test_substitute_args_no_interference() {
+        // Ensure #2 in the value of #1 doesn't get substituted as arg 2
+        let args = vec!["#2".to_string(), "real2".to_string()];
+        let result = substitute_args("#1 and #2", &args);
+        assert_eq!(result, "#2 and real2");
     }
 }

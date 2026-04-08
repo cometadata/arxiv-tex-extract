@@ -1,4 +1,4 @@
-use crate::braces::{extract_command_arg, skip_optional_arg};
+use crate::braces::{extract_command_arg, extract_command_arg_tolerant, skip_optional_arg};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -235,7 +235,7 @@ fn replace_single_arg_command(text: &str, cmd_name: &str, prefix: &str, suffix: 
         }
 
         let after_opt = skip_optional_arg(text, cmd_end);
-        if let Some((cs, ce, after_close)) = extract_command_arg(text, after_opt) {
+        if let Some((cs, ce, after_close)) = extract_command_arg_tolerant(text, after_opt) {
             result.push_str(&text[last_end..abs_pos]);
             result.push_str(prefix);
             result.push_str(&text[cs..ce]);
@@ -508,5 +508,15 @@ mod tests {
         // Letters without Unicode superscript equivalents pass through
         let result = convert_formatting(r"\textsuperscript{a}");
         assert_eq!(result, "a");
+    }
+
+    #[test]
+    fn test_tolerant_unclosed_brace() {
+        // Unclosed brace should still extract content rather than lose it
+        let result = convert_formatting("\\textbf{unclosed text");
+        assert!(
+            result.contains("unclosed text"),
+            "tolerant should preserve content: {result}"
+        );
     }
 }

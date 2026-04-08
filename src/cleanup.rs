@@ -1,4 +1,5 @@
 use crate::braces::{extract_command_arg, find_command_end};
+use crate::environments::MATH_ENVS;
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -8,6 +9,7 @@ const SPACING_COMMANDS: &[&str] = &[
     "quad", "qquad", "hfill", "vfill", "hspace", "vspace",
     "bigskip", "medskip", "smallskip", "noindent", "indent",
     "newline", "linebreak", "pagebreak", "newpage", "clearpage",
+    "cleardoublepage",
     "hline", "cline", "toprule", "midrule", "bottomrule",
     "nonumber", "notag", "allowbreak",
 ];
@@ -45,6 +47,8 @@ static LENGTH_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
 const NOOP_COMMANDS: &[&str] = &[
     "relax", "par", "empty", "protect", "raggedright", "raggedleft",
     "centering", "sloppy", "fussy", "samepage", "nopagebreak",
+    "tableofcontents", "listoffigures", "listoftables",
+    "makeatletter", "makeatother", "appendix",
 ];
 
 /// Commands whose entire invocation (command + N braced args) should be removed.
@@ -70,6 +74,15 @@ const STRIP_WITH_ARGS: &[(&str, usize)] = &[
     ("renewenvironment", 3),
     ("addcontentsline", 3),
     ("xymatrix", 1),
+    // Configuration commands whose args should not leak as text
+    ("hypersetup", 1),
+    ("definecolor", 3),
+    ("colorlet", 2),
+    ("lstset", 1),
+    ("markboth", 2),
+    ("markright", 1),
+    ("DeclareRobustCommand", 2),
+    ("pagenumbering", 1),
 ];
 
 /// Strip commands that collide with diacritic patterns.
@@ -142,7 +155,8 @@ fn strip_command_with_args(text: &str, cmd_name: &str, n_args: usize) -> String 
 // Math-region detection (used to protect math from cleanup transforms)
 // ---------------------------------------------------------------------------
 
-/// Identify byte ranges of math regions: `$...$`, `$$...$$`, `\(...\)`, `\[...\]`.
+/// Identify byte ranges of math regions: `$...$`, `$$...$$`, `\(...\)`, `\[...\]`,
+/// and named math environments like `\begin{equation}...\end{equation}`.
 /// Returns a sorted, non-overlapping `Vec<(start, end)>` (end is exclusive).
 fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
@@ -216,7 +230,38 @@ fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
         }
         i += 1;
     }
-    regions
+
+    // Also detect named math environments (safety net for unconverted envs).
+    // Uses the canonical MATH_ENVS list from environments.rs.
+    for env in MATH_ENVS {
+        let begin_pat = format!("\\begin{{{env}}}");
+        let end_pat = format!("\\end{{{env}}}");
+        let mut search = 0;
+        while let Some(bp) = text[search..].find(&begin_pat) {
+            let abs_begin = search + bp;
+            if let Some(ep) = text[abs_begin..].find(&end_pat) {
+                let abs_end = abs_begin + ep + end_pat.len();
+                regions.push((abs_begin, abs_end));
+                search = abs_end;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Sort and merge overlapping regions
+    regions.sort_by_key(|&(s, _)| s);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(regions.len());
+    for (s, e) in regions {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    merged
 }
 
 /// Check if byte position `pos` falls inside any math region (binary search).
@@ -688,6 +733,23 @@ mod tests {
     fn test_escaped_dollar_not_math() {
         let regions = find_math_regions(r"costs \$5 not math");
         assert_eq!(regions.len(), 0);
+    }
+
+    #[test]
+    fn test_find_math_regions_named_env() {
+        let input = r"text \begin{equation}x^2\end{equation} more";
+        let regions = find_math_regions(input);
+        assert_eq!(regions.len(), 1);
+        let (s, e) = regions[0];
+        assert!(input[s..e].contains("x^2"));
+    }
+
+    #[test]
+    fn test_find_math_regions_merge_overlapping() {
+        // $$ inside a named env should merge into one region
+        let input = r"\begin{equation}$$x$$\end{equation}";
+        let regions = find_math_regions(input);
+        assert_eq!(regions.len(), 1, "overlapping regions should merge");
     }
 
     #[test]

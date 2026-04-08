@@ -42,11 +42,14 @@ const TABULAR_ENVS: &[&str] = &[
     "array",
 ];
 
-/// Math display environments
-const MATH_ENVS: &[&str] = &[
+/// Math display environments.
+/// Also used by `cleanup::find_math_regions` to protect math content from cleanup transforms.
+pub(crate) const MATH_ENVS: &[&str] = &[
     "equation", "equation*", "align", "align*", "gather", "gather*",
     "multline", "multline*", "eqnarray", "eqnarray*",
     "displaymath", "flalign", "flalign*",
+    "alignat", "alignat*",
+    "math", "dmath", "dmath*",
 ];
 
 /// Algorithm / pseudocode environments
