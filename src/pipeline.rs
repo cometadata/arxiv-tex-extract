@@ -4,7 +4,10 @@ use crate::diacritics::convert_diacritics;
 use crate::environments::convert_environments;
 use crate::formatting::convert_formatting;
 use crate::input_resolve::{resolve_and_order, TexFile};
-use crate::macros::{collect_macros, collect_newtheorems, expand_macros};
+use crate::macros::{
+    collect_macros, collect_newtheorems, collect_parametric_macros, expand_macros,
+    expand_parametric_macros, normalize_shorthands, ParametricMacro,
+};
 use crate::preamble::extract_body;
 use crate::references::convert_references;
 use crate::structure::convert_structure;
@@ -16,6 +19,7 @@ use std::collections::HashMap;
 /// State threaded through the pipeline to share data between stages.
 pub struct PipelineContext {
     pub macros: HashMap<String, String>,
+    pub parametric_macros: Vec<ParametricMacro>,
     pub custom_theorems: HashMap<String, String>,
     pub section_label_map: HashMap<String, String>,
 }
@@ -45,11 +49,14 @@ pub fn extract_text_timed(tex_files: &[TexFile]) -> ExtractionOutput {
 
     let mut ctx = PipelineContext {
         macros: HashMap::new(),
+        parametric_macros: Vec::new(),
         custom_theorems: HashMap::new(),
         section_label_map: HashMap::new(),
     };
     for f in tex_files {
         ctx.macros.extend(collect_macros(&f.content));
+        ctx.parametric_macros
+            .extend(collect_parametric_macros(&f.content));
         ctx.custom_theorems.extend(collect_newtheorems(&f.content));
     }
 
@@ -100,7 +107,11 @@ fn clean_tex_file(
     };
 
     body = timings.time("remove_comments", || remove_comments(&body));
+    body = timings.time("normalize_shorthands", || normalize_shorthands(&body));
     body = timings.time("expand_macros", || expand_macros(&body, &ctx.macros));
+    body = timings.time("expand_parametric", || {
+        expand_parametric_macros(&body, &ctx.parametric_macros)
+    });
     body = timings.time("convert_structure", || {
         convert_structure(&body, &mut ctx.section_label_map)
     });
@@ -312,7 +323,71 @@ Hello.
         let names: Vec<&str> = timings.entries().iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"remove_comments"));
         assert!(names.contains(&"expand_macros"));
+        assert!(names.contains(&"expand_parametric"));
         assert!(names.contains(&"convert_structure"));
         assert!(names.contains(&"cleanup"));
+    }
+
+    #[test]
+    fn test_parametric_macro_single_arg() {
+        let files = vec![TexFile {
+            name: "main.tex".into(),
+            content: r"\documentclass{article}
+\newcommand{\vect}[1]{\mathbf{#1}}
+\begin{document}
+The vector \vect{x} is important.
+\end{document}"
+                .into(),
+        }];
+        let result = extract_text(&files).unwrap();
+        assert!(!result.contains("\\vect"), "\\vect should be expanded: {result}");
+    }
+
+    #[test]
+    fn test_parametric_macro_two_args() {
+        let files = vec![TexFile {
+            name: "main.tex".into(),
+            content: r"\documentclass{article}
+\newcommand{\inner}[2]{\langle #1, #2 \rangle}
+\begin{document}
+Value: \inner{a}{b}.
+\end{document}"
+                .into(),
+        }];
+        let result = extract_text(&files).unwrap();
+        assert!(!result.contains("\\inner"), "\\inner should be expanded: {result}");
+        assert!(result.contains("a") && result.contains("b"), "args present: {result}");
+    }
+
+    #[test]
+    fn test_parametric_macro_with_optional_default() {
+        let files = vec![TexFile {
+            name: "main.tex".into(),
+            content: r"\documentclass{article}
+\newcommand{\greet}[2][Hello]{#1, #2!}
+\begin{document}
+\greet{World}
+\greet[Hi]{World}
+\end{document}"
+                .into(),
+        }];
+        let result = extract_text(&files).unwrap();
+        assert!(result.contains("Hello, World!"), "default opt: {result}");
+        assert!(result.contains("Hi, World!"), "explicit opt: {result}");
+    }
+
+    #[test]
+    fn test_parametric_def_macro() {
+        let files = vec![TexFile {
+            name: "main.tex".into(),
+            content: r"\documentclass{article}
+\def\norm#1{\left\|#1\right\|}
+\begin{document}
+Result: \norm{x}.
+\end{document}"
+                .into(),
+        }];
+        let result = extract_text(&files).unwrap();
+        assert!(!result.contains("\\norm"), "\\norm should be expanded: {result}");
     }
 }

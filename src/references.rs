@@ -161,6 +161,8 @@ pub fn convert_references(text: &str, section_labels: &HashMap<String, String>) 
 
     result = replace_href_command(&result);
 
+    result = replace_hyperref_command(&result);
+
     result = convert_bibitems(&result, &cite_map);
 
     result
@@ -335,6 +337,38 @@ fn convert_bibitems(text: &str, cite_map: &HashMap<String, String>) -> String {
     result
 }
 
+/// Replace \hyperref[label]{text} → text (extract braced argument, skip optional label).
+fn replace_hyperref_command(text: &str) -> String {
+    let pattern = "\\hyperref";
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    let mut search_start = 0;
+    while let Some(pos) = text[search_start..].find(pattern) {
+        let abs_pos = search_start + pos;
+        let after = abs_pos + pattern.len();
+        let bytes = text.as_bytes();
+
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+
+        let after_opt = skip_optional_arg(text, after);
+        if let Some((cs, ce, after_close)) = extract_command_arg(text, after_opt) {
+            result.push_str(&text[last_end..abs_pos]);
+            result.push_str(&text[cs..ce]);
+            last_end = after_close;
+            search_start = after_close;
+        } else {
+            search_start = after;
+        }
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
 /// Replace \href{url}{text} → text (extract second argument).
 fn replace_href_command(text: &str) -> String {
     let pattern = "\\href";
@@ -375,8 +409,6 @@ mod tests {
     fn cr(text: &str) -> String {
         convert_references(text, &HashMap::new())
     }
-
-    // --- Citation resolution with numeric indices ---
 
     #[test]
     fn test_cite_with_bibitem_resolves_to_number() {
@@ -430,8 +462,6 @@ mod tests {
         assert!(result.contains("[2]"), "second bibitem should be [2]: {result}");
     }
 
-    // --- Cross-reference resolution ---
-
     #[test]
     fn test_ref_with_label_resolves() {
         let input = r"\label{fig:x} \ref{fig:x}";
@@ -458,8 +488,6 @@ mod tests {
         assert_eq!(result, " Introduction");
     }
 
-    // --- URL / href ---
-
     #[test]
     fn test_url() {
         let result = cr(r"\url{https://example.com}");
@@ -472,8 +500,6 @@ mod tests {
         assert_eq!(result, "click here");
     }
 
-    // --- Boundary checks ---
-
     #[test]
     fn test_citation_not_matching_longer() {
         let result = cr(r"\citation{x}");
@@ -485,8 +511,6 @@ mod tests {
         let result = cr(r"\bibitemize{x}");
         assert_eq!(result, r"\bibitemize{x}");
     }
-
-    // --- Journal macros ---
 
     #[test]
     fn test_journal_macro_apj() {
@@ -527,5 +551,17 @@ mod tests {
         let input = r"\cite{a} \bibitem[1]{a} A. \bibitem[2]{b} B.";
         let result = cr(input);
         assert!(result.contains("[1]"), "numeric mode cite: {result}");
+    }
+
+    #[test]
+    fn test_hyperref() {
+        let result = cr(r"\hyperref[sec:intro]{Introduction}");
+        assert_eq!(result, "Introduction");
+    }
+
+    #[test]
+    fn test_hyperref_no_optional() {
+        let result = cr(r"\hyperref{text}");
+        assert_eq!(result, "text");
     }
 }

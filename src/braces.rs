@@ -31,6 +31,44 @@ pub fn find_braced_group(s: &str, open_pos: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// Tolerant variant of `find_braced_group`. If no matching `}` is found,
+/// returns content up to the next paragraph break (`\n\n`), next `\` command,
+/// or end of string, rather than `None`.
+///
+/// Use this for formatting commands where dropping content entirely is worse
+/// than a slightly imprecise boundary (e.g., `\textbf{unclosed text`).
+pub fn find_braced_group_tolerant(s: &str, open_pos: usize) -> Option<(usize, usize)> {
+    // Try strict matching first
+    if let result @ Some(_) = find_braced_group(s, open_pos) {
+        return result;
+    }
+    let bytes = s.as_bytes();
+    if bytes.get(open_pos) != Some(&b'{') {
+        return None;
+    }
+    let content_start = open_pos + 1;
+    // Fallback: scan to the next paragraph break, next \ command, or end of line
+    let mut i = content_start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' if i + 1 < bytes.len() && bytes[i + 1] == b'\n' => {
+                return Some((content_start, i));
+            }
+            b'\\' if i + 1 < bytes.len() && bytes[i + 1].is_ascii_alphabetic() => {
+                return Some((content_start, i));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Hit end of string
+    if i > content_start {
+        Some((content_start, i))
+    } else {
+        None
+    }
+}
+
 /// After a command name ends at position `cmd_end`, skip optional whitespace,
 /// look for `{`, and extract the braced argument.
 ///
@@ -48,6 +86,28 @@ pub fn extract_command_arg(s: &str, cmd_end: usize) -> Option<(usize, usize, usi
     }
     let (content_start, content_end) = find_braced_group(s, i)?;
     Some((content_start, content_end, content_end + 1))
+}
+
+/// Tolerant variant of `extract_command_arg`. Falls back to
+/// `find_braced_group_tolerant` when strict brace matching fails.
+pub fn extract_command_arg_tolerant(s: &str, cmd_end: usize) -> Option<(usize, usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = cmd_end;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n') {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'{' {
+        return None;
+    }
+    let (content_start, content_end) = find_braced_group_tolerant(s, i)?;
+    // If strict match succeeded, content_end is at '}' — skip past it.
+    // If fallback was used, content_end is at the boundary — don't skip.
+    let after_close = if content_end < bytes.len() && bytes[content_end] == b'}' {
+        content_end + 1
+    } else {
+        content_end
+    };
+    Some((content_start, content_end, after_close))
 }
 
 /// Skip an optional argument `[...]` if present at position `pos`.
@@ -75,6 +135,45 @@ pub fn skip_optional_arg(s: &str, pos: usize) -> usize {
         i += 1;
     }
     if depth == 0 { i } else { pos }
+}
+
+/// Extract the content of an optional `[...]` argument starting at `pos`.
+///
+/// Skips leading whitespace, then looks for `[`. Returns
+/// `Some((content_start, content_end, after_close))` where:
+/// - `content_start..content_end` is the content inside the brackets
+/// - `after_close` is the position right after the closing `]`
+///
+/// Handles nested brackets and backslash escapes.
+pub fn extract_optional_arg(s: &str, pos: usize) -> Option<(usize, usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = pos;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n') {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'[' {
+        return None;
+    }
+    let content_start = i + 1;
+    i = content_start;
+    let mut depth = 1u32;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((content_start, i, i + 1));
+                }
+            }
+            b'\\' => {
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Find a LaTeX command like `\commandname` starting at position `pos` (which should be `\`).
@@ -189,5 +288,81 @@ mod tests {
         let s = r"{\textbf{A \emph{very \textit{important}} paper}}";
         let (cs, ce) = find_braced_group(s, 0).unwrap();
         assert_eq!(&s[cs..ce], r"\textbf{A \emph{very \textit{important}} paper}");
+    }
+
+    #[test]
+    fn test_tolerant_matched_delegates_to_strict() {
+        let s = "{hello}";
+        assert_eq!(find_braced_group_tolerant(s, 0), Some((1, 6)));
+    }
+
+    #[test]
+    fn test_tolerant_unmatched_to_paragraph_break() {
+        let s = "{unclosed text\n\nmore";
+        let (cs, ce) = find_braced_group_tolerant(s, 0).unwrap();
+        assert_eq!(&s[cs..ce], "unclosed text");
+    }
+
+    #[test]
+    fn test_tolerant_unmatched_to_command() {
+        let s = "{unclosed \\section rest";
+        let (cs, ce) = find_braced_group_tolerant(s, 0).unwrap();
+        assert_eq!(&s[cs..ce], "unclosed ");
+    }
+
+    #[test]
+    fn test_tolerant_unmatched_to_eof() {
+        let s = "{unclosed text";
+        let (cs, ce) = find_braced_group_tolerant(s, 0).unwrap();
+        assert_eq!(&s[cs..ce], "unclosed text");
+    }
+
+    #[test]
+    fn test_tolerant_no_opening_brace() {
+        assert_eq!(find_braced_group_tolerant("hello", 0), None);
+    }
+
+    #[test]
+    fn test_extract_command_arg_tolerant_matched() {
+        let s = r"\cmd{content}";
+        let result = extract_command_arg_tolerant(s, 4).unwrap();
+        assert_eq!(&s[result.0..result.1], "content");
+        assert_eq!(result.2, s.len());
+    }
+
+    #[test]
+    fn test_extract_command_arg_tolerant_unmatched() {
+        let s = r"\cmd{unclosed text";
+        let (cs, ce, after) = extract_command_arg_tolerant(s, 4).unwrap();
+        assert_eq!(&s[cs..ce], "unclosed text");
+        assert_eq!(after, s.len()); // at end of string, no } to skip
+    }
+
+    #[test]
+    fn test_extract_optional_arg_present() {
+        let s = "[content]rest";
+        let (cs, ce, after) = extract_optional_arg(s, 0).unwrap();
+        assert_eq!(&s[cs..ce], "content");
+        assert_eq!(after, 9);
+    }
+
+    #[test]
+    fn test_extract_optional_arg_nested() {
+        let s = "[a [b] c]rest";
+        let (cs, ce, after) = extract_optional_arg(s, 0).unwrap();
+        assert_eq!(&s[cs..ce], "a [b] c");
+        assert_eq!(after, 9);
+    }
+
+    #[test]
+    fn test_extract_optional_arg_absent() {
+        assert_eq!(extract_optional_arg("{content}", 0), None);
+    }
+
+    #[test]
+    fn test_extract_optional_arg_whitespace() {
+        let s = "  [content]";
+        let (cs, ce, _) = extract_optional_arg(s, 0).unwrap();
+        assert_eq!(&s[cs..ce], "content");
     }
 }

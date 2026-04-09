@@ -53,6 +53,15 @@ static SPECIAL_CHARS_BARE: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\L", "Ł"),
         ("\\i", "ı"),
         ("\\j", "ȷ"),
+        // Special Latin characters
+        ("\\DJ", "Đ"),
+        ("\\dj", "đ"),
+        ("\\TH", "Þ"),
+        ("\\th", "þ"),
+        ("\\DH", "Ð"),
+        ("\\dh", "ð"),
+        ("\\NG", "Ŋ"),
+        ("\\ng", "ŋ"),
     ])
 });
 
@@ -113,9 +122,72 @@ static DIACRITIC_PATTERNS: LazyLock<DiacriticPatterns> = LazyLock::new(|| {
     }
 });
 
+/// Handle `\not` as a combining long solidus overlay (U+0338).
+/// `\not=` → combining overlay on `=`, `\not\equiv` → overlay on equiv symbol, etc.
+fn convert_not_overlay(text: &str) -> String {
+    let pattern = "\\not";
+    let mut result = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut last_end = 0;
+    let mut search_start = 0;
+
+    while let Some(pos) = text[search_start..].find(pattern) {
+        let abs_pos = search_start + pos;
+        let after = abs_pos + pattern.len();
+
+        // Boundary: skip \nothing, \notation, etc.
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+
+        result.push_str(&text[last_end..abs_pos]);
+
+        if after < bytes.len() {
+            // Skip optional whitespace between \not and the next token
+            let mut cursor = after;
+            while cursor < bytes.len() && (bytes[cursor] == b' ' || bytes[cursor] == b'\t') {
+                cursor += 1;
+            }
+
+            if cursor < bytes.len() {
+                if bytes[cursor] == b'\\' {
+                    // \not\command — find the command end and apply overlay to first char of replacement
+                    // For text extraction, just skip the \not and leave the command as-is
+                    // (the command will be converted to its Unicode symbol later,
+                    //  and many negated forms already have dedicated commands like \neq, \notin)
+                    last_end = after;
+                } else {
+                    // \not followed by a single character: apply combining solidus
+                    let c = &text[cursor..];
+                    if let Some(ch) = c.chars().next() {
+                        result.push(ch);
+                        result.push('\u{0338}');
+                        last_end = cursor + ch.len_utf8();
+                    } else {
+                        last_end = after;
+                    }
+                }
+            } else {
+                last_end = after;
+            }
+        } else {
+            last_end = after;
+        }
+
+        search_start = last_end;
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
 /// Convert LaTeX diacritics to Unicode.
 pub fn convert_diacritics(text: &str) -> String {
     let mut result = text.to_string();
+
+    // \not overlay: apply before symbol conversion so \not= etc. get combining mark
+    result = convert_not_overlay(&result);
 
     for &(from, to) in SPECIAL_CHARS_BRACED {
         result = result.replace(from, to);
@@ -331,5 +403,18 @@ mod tests {
     #[test]
     fn test_hacek_dotless_i() {
         assert_eq!(convert_diacritics(r"\v{\i}"), "ǐ");
+    }
+
+    #[test]
+    fn test_not_equals() {
+        let result = convert_diacritics(r"\not=");
+        assert!(result.contains("=") && result.contains("\u{0338}"), "not=: {result}");
+    }
+
+    #[test]
+    fn test_not_boundary() {
+        // \nothing should NOT match \not
+        let result = convert_diacritics(r"\nothing");
+        assert_eq!(result, r"\nothing");
     }
 }

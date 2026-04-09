@@ -1,13 +1,20 @@
 use crate::braces::{extract_command_arg, find_command_end};
+use crate::environments::MATH_ENVS;
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
+
+/// Regex to strip `\left`, `\right`, and `\big` sizing decorators from delimiters.
+static LEFT_RIGHT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\\(?:left|right|[Bb]ig{1,2}[lr])\s*(\\[{}|]|[()\[\]|.])").unwrap()
+});
 
 /// Spacing commands to replace with a space (handled in cleanup).
 const SPACING_COMMANDS: &[&str] = &[
     "quad", "qquad", "hfill", "vfill", "hspace", "vspace",
     "bigskip", "medskip", "smallskip", "noindent", "indent",
     "newline", "linebreak", "pagebreak", "newpage", "clearpage",
+    "cleardoublepage",
     "hline", "cline", "toprule", "midrule", "bottomrule",
     "nonumber", "notag", "allowbreak",
 ];
@@ -19,10 +26,6 @@ const FONT_SWITCHES: &[&str] = &[
     "upshape", "slshape", "scshape", "sffamily",
     "rmfamily", "ttfamily",
 ];
-
-// ---------------------------------------------------------------------------
-// Pre-diacritic stripping (runs BEFORE convert_diacritics)
-// ---------------------------------------------------------------------------
 
 /// TeX spacing commands that take a dimension argument and collide with
 /// single-letter diacritic accents (e.g. `\vskip` vs `\v`, `\kern` vs `\k`).
@@ -45,6 +48,9 @@ static LENGTH_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
 const NOOP_COMMANDS: &[&str] = &[
     "relax", "par", "empty", "protect", "raggedright", "raggedleft",
     "centering", "sloppy", "fussy", "samepage", "nopagebreak",
+    "tableofcontents", "listoffigures", "listoftables",
+    "makeatletter", "makeatother", "appendix",
+    "makeindex", "printindex", "printglossary",
 ];
 
 /// Commands whose entire invocation (command + N braced args) should be removed.
@@ -70,6 +76,23 @@ const STRIP_WITH_ARGS: &[(&str, usize)] = &[
     ("renewenvironment", 3),
     ("addcontentsline", 3),
     ("xymatrix", 1),
+    ("geometry", 1),
+    ("usetikzlibrary", 1),
+    ("tikzset", 1),
+    ("pgfplotsset", 1),
+    ("addvspace", 1),
+    // Configuration commands whose args should not leak as text
+    ("hypersetup", 1),
+    ("definecolor", 3),
+    ("colorlet", 2),
+    ("lstset", 1),
+    ("markboth", 2),
+    ("markright", 1),
+    ("DeclareRobustCommand", 2),
+    ("pagenumbering", 1),
+    // Index/glossary entries (should not leak into text)
+    ("index", 1),
+    ("glossary", 1),
 ];
 
 /// Strip commands that collide with diacritic patterns.
@@ -79,6 +102,7 @@ const STRIP_WITH_ARGS: &[(&str, usize)] = &[
 pub fn strip_pre_diacritic_commands(text: &str) -> String {
     let mut result = text.to_string();
 
+    result = strip_left_right_delimiters(&result);
     result = SPACING_DIM_RE.replace_all(&result, " ").to_string();
     result = LENGTH_ASSIGN_RE.replace_all(&result, " ").to_string();
 
@@ -95,6 +119,22 @@ pub fn strip_pre_diacritic_commands(text: &str) -> String {
     }
 
     result
+}
+
+/// Strip `\left`, `\right`, and `\big*` sizing decorators, leaving the delimiter.
+/// `\left(` → `(`, `\left\{` → `{`, `\left.` → nothing (invisible delimiter).
+fn strip_left_right_delimiters(text: &str) -> String {
+    LEFT_RIGHT_RE
+        .replace_all(text, |caps: &regex::Captures| {
+            match caps.get(1).unwrap().as_str() {
+                "\\{" => "{".to_string(),
+                "\\}" => "}".to_string(),
+                "\\|" => "\u{2016}".to_string(),
+                "." => String::new(),
+                other => other.to_string(),
+            }
+        })
+        .to_string()
 }
 
 /// Remove `\cmd{arg1}{arg2}...` consuming exactly `n_args` braced groups.
@@ -138,13 +178,10 @@ fn strip_command_with_args(text: &str, cmd_name: &str, n_args: usize) -> String 
     result
 }
 
-// ---------------------------------------------------------------------------
-// Math-region detection (used to protect math from cleanup transforms)
-// ---------------------------------------------------------------------------
-
-/// Identify byte ranges of math regions: `$...$`, `$$...$$`, `\(...\)`, `\[...\]`.
+/// Identify byte ranges of math regions: `$...$`, `$$...$$`, `\(...\)`, `\[...\]`,
+/// and named math environments like `\begin{equation}...\end{equation}`.
 /// Returns a sorted, non-overlapping `Vec<(start, end)>` (end is exclusive).
-fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
+pub(crate) fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut regions = Vec::new();
     let mut i = 0;
@@ -216,11 +253,42 @@ fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
         }
         i += 1;
     }
-    regions
+
+    // Also detect named math environments (safety net for unconverted envs).
+    // Uses the canonical MATH_ENVS list from environments.rs.
+    for env in MATH_ENVS {
+        let begin_pat = format!("\\begin{{{env}}}");
+        let end_pat = format!("\\end{{{env}}}");
+        let mut search = 0;
+        while let Some(bp) = text[search..].find(&begin_pat) {
+            let abs_begin = search + bp;
+            if let Some(ep) = text[abs_begin..].find(&end_pat) {
+                let abs_end = abs_begin + ep + end_pat.len();
+                regions.push((abs_begin, abs_end));
+                search = abs_end;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Sort and merge overlapping regions
+    regions.sort_by_key(|&(s, _)| s);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(regions.len());
+    for (s, e) in regions {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    merged
 }
 
 /// Check if byte position `pos` falls inside any math region (binary search).
-fn in_math(pos: usize, regions: &[(usize, usize)]) -> bool {
+pub(crate) fn in_math(pos: usize, regions: &[(usize, usize)]) -> bool {
     regions
         .binary_search_by(|&(start, end)| {
             if pos < start {
@@ -242,7 +310,7 @@ static MATH_KEEP: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         "exp", "min", "max", "sup", "inf", "arg", "det", "dim",
         "gcd", "hom", "ker", "deg", "Pr", "oint", "iint", "iiint",
         "bigcup", "bigcap", "bigoplus", "bigotimes", "coprod",
-        "mathbb", "mathscr", "mathcal", "mathrm", "mathbf",
+        "mathbb", "mathscr", "mathcal", "mathrm", "mathbf", "mathtt",
     ]
     .into_iter()
     .collect()
@@ -691,6 +759,23 @@ mod tests {
     }
 
     #[test]
+    fn test_find_math_regions_named_env() {
+        let input = r"text \begin{equation}x^2\end{equation} more";
+        let regions = find_math_regions(input);
+        assert_eq!(regions.len(), 1);
+        let (s, e) = regions[0];
+        assert!(input[s..e].contains("x^2"));
+    }
+
+    #[test]
+    fn test_find_math_regions_merge_overlapping() {
+        // $$ inside a named env should merge into one region
+        let input = r"\begin{equation}$$x$$\end{equation}";
+        let regions = find_math_regions(input);
+        assert_eq!(regions.len(), 1, "overlapping regions should merge");
+    }
+
+    #[test]
     fn test_reflow_joins_paragraph_lines() {
         let input = "This is a line\nthat continues here.";
         let result = reflow_paragraphs(input);
@@ -789,5 +874,86 @@ mod tests {
         assert!(result.contains("text"));
         assert!(!result.contains("addcontentsline"));
         assert!(!result.contains("toc"));
+    }
+
+    // --- \left/\right stripping ---
+
+    #[test]
+    fn test_left_right_parens() {
+        let result = strip_left_right_delimiters(r"\left( x \right)");
+        assert_eq!(result, "( x )");
+    }
+
+    #[test]
+    fn test_left_right_brackets() {
+        let result = strip_left_right_delimiters(r"\left[ x \right]");
+        assert_eq!(result, "[ x ]");
+    }
+
+    #[test]
+    fn test_left_right_braces() {
+        let result = strip_left_right_delimiters(r"\left\{ x \right\}");
+        assert_eq!(result, "{ x }");
+    }
+
+    #[test]
+    fn test_left_right_pipe() {
+        let result = strip_left_right_delimiters(r"\left| x \right|");
+        assert_eq!(result, "| x |");
+    }
+
+    #[test]
+    fn test_left_right_invisible() {
+        let result = strip_left_right_delimiters(r"\left. x \right)");
+        assert_eq!(result, " x )");
+    }
+
+    #[test]
+    fn test_left_right_double_pipe() {
+        let result = strip_left_right_delimiters(r"\left\| x \right\|");
+        assert_eq!(result, "\u{2016} x \u{2016}");
+    }
+
+    #[test]
+    fn test_big_delimiters() {
+        let result = strip_left_right_delimiters(r"\bigl( x \bigr)");
+        assert_eq!(result, "( x )");
+    }
+
+    #[test]
+    fn test_bigg_delimiters() {
+        let result = strip_left_right_delimiters(r"\Biggl( x \Biggr)");
+        assert_eq!(result, "( x )");
+    }
+
+    // --- Stage 5c: additional strip commands ---
+
+    #[test]
+    fn test_geometry_stripped() {
+        let result = strip_pre_diacritic_commands(r"\geometry{margin=1in} text");
+        assert!(result.contains("text"));
+        assert!(!result.contains("geometry"));
+    }
+
+    #[test]
+    fn test_tikzset_stripped() {
+        let result = strip_pre_diacritic_commands(r"\tikzset{foo=bar} text");
+        assert!(result.contains("text"));
+        assert!(!result.contains("tikzset"));
+    }
+
+    #[test]
+    fn test_index_stripped() {
+        let result = strip_pre_diacritic_commands(r"text\index{keyword} more");
+        assert!(result.contains("text"));
+        assert!(result.contains("more"));
+        assert!(!result.contains("keyword"), "index should be stripped: {result}");
+    }
+
+    #[test]
+    fn test_makeindex_stripped() {
+        let result = strip_pre_diacritic_commands(r"\makeindex some text");
+        assert!(result.contains("some text"));
+        assert!(!result.contains("makeindex"));
     }
 }

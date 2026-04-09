@@ -1,6 +1,8 @@
-use crate::braces::{extract_command_arg, skip_optional_arg};
+use crate::braces::{extract_command_arg, extract_command_arg_tolerant, extract_optional_arg, skip_optional_arg};
+use crate::cleanup::{find_math_regions, in_math};
 use regex::Regex;
 use std::sync::LazyLock;
+use unicode_normalization::UnicodeNormalization;
 
 /// Commands that wrap content in emphasis: \emph{x} → *x*
 const EMPH_COMMANDS: &[&str] = &["emph", "textit", "textsl"];
@@ -9,13 +11,18 @@ const EMPH_COMMANDS: &[&str] = &["emph", "textit", "textsl"];
 const BOLD_COMMANDS: &[&str] = &["textbf", "mathbf", "boldsymbol", "bm"];
 
 /// Commands that unwrap to just their content: \textrm{x} → x
+///
+/// NOTE: math accents (hat, tilde, bar, vec, dot, ddot, acute, grave, check, breve,
+/// overline, underline) are handled by convert_math_accents() instead.
+/// Math font styles (mathcal, mathbb, mathfrak, mathsf, Bbb) are handled by
+/// convert_symbols() in symbols.rs instead.
 const UNWRAP_COMMANDS: &[&str] = &[
     "textrm", "textsc", "texttt", "textsf", "text", "textnormal",
-    "mathrm", "mathit", "mathcal", "mathbb", "mathfrak", "mathsf",
+    "mathrm", "mathit",
     "operatorname",
-    "cal", "Bbb",
-    "hat", "tilde", "widetilde", "widehat", "bar", "overline",
-    "underline", "vec", "dot", "ddot", "acute", "grave", "check", "breve",
+    "cal",
+    "widetilde", "widehat",
+    "ensuremath",
     "mbox", "hbox", "vbox", "fbox",
     "country",
     "citenamefont", "bibnamefont", "bibfnamefont",
@@ -28,7 +35,7 @@ const UNWRAP_COMMANDS: &[&str] = &[
 ];
 
 /// Two-argument commands where we want the SECOND argument: \textcolor{red}{text} → text
-const TWO_ARG_SECOND: &[&str] = &["textcolor", "colorbox"];
+const TWO_ARG_SECOND: &[&str] = &["textcolor", "colorbox", "texorpdfstring"];
 
 /// Three-argument commands where we want the THIRD argument: \multicolumn{n}{align}{content} → content
 const THREE_ARG_THIRD: &[&str] = &["multicolumn"];
@@ -40,6 +47,7 @@ const INLINE_COMMANDS: &[&str] = &[
     "authornote", "cortext", "corref", "fntext", "ead",
     "corauth",
     "collaboration", "onbehalf",
+    "endnote",
 ];
 
 /// Commands to strip entirely (cross-reference markers, etc.)
@@ -62,9 +70,360 @@ const SPACE_BEFORE_UPPER: &[&str] = &[
 static FOOTNOTE_MARK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\footnotemark").unwrap());
 
+/// Handle `\verb|...|` and `\verb*|...|` — delimiter-aware inline verbatim.
+/// The delimiter is the first non-whitespace character after `\verb` (or `\verb*`).
+fn convert_inline_verb(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut last_end = 0;
+    let mut search_start = 0;
+
+    while let Some(pos) = text[search_start..].find("\\verb") {
+        let abs_pos = search_start + pos;
+        let mut after = abs_pos + 5; // after "\verb"
+
+        // Check for * variant
+        if after < bytes.len() && bytes[after] == b'*' {
+            after += 1;
+        }
+
+        // Boundary check: skip \verbatim, \verbose, etc.
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+
+        // Next character is the delimiter
+        if after >= bytes.len() {
+            search_start = after;
+            continue;
+        }
+        let delim = bytes[after];
+        let content_start = after + 1;
+
+        // Find matching delimiter
+        if let Some(end_offset) = text[content_start..].find(delim as char) {
+            let content_end = content_start + end_offset;
+            result.push_str(&text[last_end..abs_pos]);
+            result.push_str(&text[content_start..content_end]);
+            last_end = content_end + 1;
+            search_start = last_end;
+        } else {
+            search_start = content_start;
+        }
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// Handle `\lstinline|...|` and `\lstinline{...}` — listings package inline code.
+fn convert_lstinline(text: &str) -> String {
+    let pattern = "\\lstinline";
+    let mut result = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut last_end = 0;
+    let mut search_start = 0;
+
+    while let Some(pos) = text[search_start..].find(pattern) {
+        let abs_pos = search_start + pos;
+        let after = abs_pos + pattern.len();
+
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+
+        if after >= bytes.len() {
+            search_start = after;
+            continue;
+        }
+
+        // Braced form: \lstinline{...}
+        if bytes[after] == b'{' {
+            if let Some((cs, ce, after_close)) = extract_command_arg(text, after) {
+                result.push_str(&text[last_end..abs_pos]);
+                result.push_str(&text[cs..ce]);
+                last_end = after_close;
+                search_start = after_close;
+                continue;
+            }
+        }
+
+        // Skip optional [options] arg
+        let after_opt = skip_optional_arg(text, after);
+
+        // Delimiter form: \lstinline|...|
+        if after_opt < bytes.len() && bytes[after_opt] != b'{' {
+            let delim = bytes[after_opt];
+            let content_start = after_opt + 1;
+            if let Some(end_offset) = text[content_start..].find(delim as char) {
+                let content_end = content_start + end_offset;
+                result.push_str(&text[last_end..abs_pos]);
+                result.push_str(&text[content_start..content_end]);
+                last_end = content_end + 1;
+                search_start = last_end;
+                continue;
+            }
+        } else if after_opt < bytes.len() {
+            // Braced form after optional arg
+            if let Some((cs, ce, after_close)) = extract_command_arg(text, after_opt) {
+                result.push_str(&text[last_end..abs_pos]);
+                result.push_str(&text[cs..ce]);
+                last_end = after_close;
+                search_start = after_close;
+                continue;
+            }
+        }
+
+        search_start = after;
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// Handle `\mintinline{lang}{code}` — minted package inline code.
+fn convert_mintinline(text: &str) -> String {
+    let pattern = "\\mintinline";
+    let mut result = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut last_end = 0;
+    let mut search_start = 0;
+
+    while let Some(pos) = text[search_start..].find(pattern) {
+        let abs_pos = search_start + pos;
+        let after = abs_pos + pattern.len();
+
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+
+        // Skip first arg (language)
+        if let Some((_, _, after_first)) = extract_command_arg(text, after) {
+            // Extract second arg (code)
+            if let Some((cs2, ce2, after_second)) = extract_command_arg(text, after_first) {
+                result.push_str(&text[last_end..abs_pos]);
+                result.push_str(&text[cs2..ce2]);
+                last_end = after_second;
+                search_start = after_second;
+                continue;
+            }
+        }
+        search_start = after;
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// Math accent commands mapped to their Unicode combining marks.
+const MATH_ACCENT_MAP: &[(&str, char)] = &[
+    ("hat",       '\u{0302}'), // COMBINING CIRCUMFLEX
+    ("tilde",     '\u{0303}'), // COMBINING TILDE
+    ("bar",       '\u{0305}'), // COMBINING OVERLINE
+    ("vec",       '\u{20D7}'), // COMBINING RIGHT ARROW ABOVE
+    ("dot",       '\u{0307}'), // COMBINING DOT ABOVE
+    ("ddot",      '\u{0308}'), // COMBINING DIAERESIS
+    ("acute",     '\u{0301}'), // COMBINING ACUTE
+    ("grave",     '\u{0300}'), // COMBINING GRAVE
+    ("check",     '\u{030C}'), // COMBINING CARON
+    ("breve",     '\u{0306}'), // COMBINING BREVE
+    ("overline",  '\u{0305}'), // COMBINING OVERLINE
+    ("underline", '\u{0332}'), // COMBINING LOW LINE
+    ("dddot",     '\u{20DB}'), // COMBINING THREE DOTS ABOVE
+    ("ddddot",    '\u{20DC}'), // COMBINING FOUR DOTS ABOVE
+];
+
+/// Convert math accent commands to combining marks for single-char arguments,
+/// or plain unwrap for multi-char arguments.
+fn convert_math_accents(text: &str) -> String {
+    let mut result = text.to_string();
+    for &(cmd_name, combining) in MATH_ACCENT_MAP {
+        result = apply_math_accent(&result, cmd_name, combining);
+    }
+    result
+}
+
+fn apply_math_accent(text: &str, cmd_name: &str, combining: char) -> String {
+    let pattern = format!("\\{}", cmd_name);
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    let mut search_start = 0;
+    while let Some(pos) = text[search_start..].find(&pattern) {
+        let abs_pos = search_start + pos;
+        let after = abs_pos + pattern.len();
+        let bytes = text.as_bytes();
+
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+
+        if let Some((cs, ce, after_close)) = extract_command_arg(text, after) {
+            let content = &text[cs..ce];
+            result.push_str(&text[last_end..abs_pos]);
+
+            let chars: Vec<char> = content.chars().collect();
+            if chars.len() == 1 {
+                let composed = format!("{}{}", chars[0], combining);
+                result.push_str(&composed.nfc().collect::<String>());
+            } else {
+                // Multi-character: fall back to plain unwrap
+                result.push_str(content);
+            }
+
+            last_end = after_close;
+            search_start = after_close;
+        } else {
+            search_start = after;
+        }
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+static FRAC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\(?:d|t|nice|c)?frac").unwrap());
+
+static BINOM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\(?:t|d)?binom").unwrap());
+
+/// Convert \frac{a}{b} → a/b outside math regions.
+fn convert_text_fractions(text: &str) -> String {
+    let math_regions = find_math_regions(text);
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for mat in FRAC_RE.find_iter(text) {
+        let start = mat.start();
+        if start < last_end {
+            continue;
+        }
+        if in_math(start, &math_regions) {
+            continue;
+        }
+
+        let after = mat.end();
+        if let Some((cs1, ce1, after1)) = extract_command_arg(text, after) {
+            if let Some((cs2, ce2, after2)) = extract_command_arg(text, after1) {
+                result.push_str(&text[last_end..start]);
+                result.push_str(&text[cs1..ce1]);
+                result.push('/');
+                result.push_str(&text[cs2..ce2]);
+                last_end = after2;
+            }
+        }
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// Convert \sqrt{x} → √(x) and \sqrt[n]{x} → √[n](x) outside math regions.
+fn convert_text_sqrt(text: &str) -> String {
+    let math_regions = find_math_regions(text);
+    let pattern = "\\sqrt";
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    let mut search_start = 0;
+
+    while let Some(pos) = text[search_start..].find(pattern) {
+        let abs_pos = search_start + pos;
+        let after = abs_pos + pattern.len();
+        let bytes = text.as_bytes();
+
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+        if abs_pos < last_end {
+            search_start = after;
+            continue;
+        }
+        if in_math(abs_pos, &math_regions) {
+            search_start = after;
+            continue;
+        }
+
+        let mut cursor = after;
+        let mut opt_arg = None;
+        if cursor < bytes.len() && bytes[cursor] == b'[' {
+            if let Some((os, oe, after_opt)) = extract_optional_arg(text, cursor) {
+                opt_arg = Some(&text[os..oe]);
+                cursor = after_opt;
+            }
+        }
+
+        if let Some((cs, ce, after_close)) = extract_command_arg(text, cursor) {
+            result.push_str(&text[last_end..abs_pos]);
+            result.push('\u{221A}');
+            if let Some(n) = opt_arg {
+                result.push('[');
+                result.push_str(n);
+                result.push(']');
+            }
+            result.push('(');
+            result.push_str(&text[cs..ce]);
+            result.push(')');
+            last_end = after_close;
+            search_start = after_close;
+        } else {
+            search_start = after;
+        }
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// Convert \binom{n}{k} → C(n,k) outside math regions.
+fn convert_text_binom(text: &str) -> String {
+    let math_regions = find_math_regions(text);
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for mat in BINOM_RE.find_iter(text) {
+        let start = mat.start();
+        if start < last_end {
+            continue;
+        }
+        if in_math(start, &math_regions) {
+            continue;
+        }
+
+        let after = mat.end();
+        if let Some((cs1, ce1, after1)) = extract_command_arg(text, after) {
+            if let Some((cs2, ce2, after2)) = extract_command_arg(text, after1) {
+                result.push_str(&text[last_end..start]);
+                result.push_str("C(");
+                result.push_str(&text[cs1..ce1]);
+                result.push(',');
+                result.push_str(&text[cs2..ce2]);
+                result.push(')');
+                last_end = after2;
+            }
+        }
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
 /// Convert LaTeX inline formatting to plaintext/markdown.
 pub fn convert_formatting(text: &str) -> String {
     let mut result = text.to_string();
+
+    // Inline verbatim: extract before any other processing
+    result = convert_inline_verb(&result);
+    result = convert_lstinline(&result);
+    result = convert_mintinline(&result);
+
+    // Math accents: apply combining marks before generic unwrap
+    result = convert_math_accents(&result);
 
     for cmd in EMPH_COMMANDS {
         result = replace_single_arg_command(&result, cmd, "*", "*");
@@ -86,6 +445,11 @@ pub fn convert_formatting(text: &str) -> String {
         result = replace_three_arg_command(&result, cmd);
     }
 
+    // Math expression conversions (outside math regions only)
+    result = convert_text_fractions(&result);
+    result = convert_text_sqrt(&result);
+    result = convert_text_binom(&result);
+
     for cmd in FONT_SIZE_COMMANDS {
         result = remove_standalone_command(&result, cmd);
     }
@@ -106,6 +470,9 @@ pub fn convert_formatting(text: &str) -> String {
     result = replace_with_unicode_script(&result, "textsubscript", false);
     // Note: \inst{N} is handled in structure.rs (convert_institute_and_inst)
     // where it has access to the \institute label→index mapping.
+
+    // Quantum notation (Dirac bra-ket)
+    result = convert_quantum_notation(&result);
 
     for cmd in SPACE_BEFORE_UPPER {
         result = replace_cmd_before_upper(&result, cmd);
@@ -235,7 +602,7 @@ fn replace_single_arg_command(text: &str, cmd_name: &str, prefix: &str, suffix: 
         }
 
         let after_opt = skip_optional_arg(text, cmd_end);
-        if let Some((cs, ce, after_close)) = extract_command_arg(text, after_opt) {
+        if let Some((cs, ce, after_close)) = extract_command_arg_tolerant(text, after_opt) {
             result.push_str(&text[last_end..abs_pos]);
             result.push_str(prefix);
             result.push_str(&text[cs..ce]);
@@ -383,6 +750,104 @@ fn strip_command_entirely(text: &str, cmd_name: &str) -> String {
     result
 }
 
+/// Convert \ket{x} → |x⟩, \bra{x} → ⟨x|, \braket{x}{y} → ⟨x|y⟩, \ketbra{x}{y} → |x⟩⟨y|
+fn convert_quantum_notation(text: &str) -> String {
+    let mut result = text.to_string();
+
+    // Two-argument commands first (longer patterns matched first)
+    result = convert_braket(&result);
+    result = convert_ketbra(&result);
+
+    // Single-argument commands
+    result = replace_single_arg_command(&result, "ket", "|\u{200B}", "\u{27E9}");
+    result = replace_single_arg_command(&result, "bra", "\u{27E8}", "|\u{200B}");
+
+    result
+}
+
+/// \braket{x}{y} → ⟨x|y⟩
+fn convert_braket(text: &str) -> String {
+    let pattern = "\\braket";
+    let mut result = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut last_end = 0;
+    let mut search_start = 0;
+
+    while let Some(pos) = text[search_start..].find(pattern) {
+        let abs_pos = search_start + pos;
+        let after = abs_pos + pattern.len();
+
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+
+        if let Some((cs1, ce1, after1)) = extract_command_arg(text, after) {
+            if let Some((cs2, ce2, after2)) = extract_command_arg(text, after1) {
+                result.push_str(&text[last_end..abs_pos]);
+                result.push('\u{27E8}');
+                result.push_str(&text[cs1..ce1]);
+                result.push('|');
+                result.push_str(&text[cs2..ce2]);
+                result.push('\u{27E9}');
+                last_end = after2;
+                search_start = after2;
+                continue;
+            }
+            // Single-arg fallback: \braket{x} → ⟨x⟩
+            result.push_str(&text[last_end..abs_pos]);
+            result.push('\u{27E8}');
+            result.push_str(&text[cs1..ce1]);
+            result.push('\u{27E9}');
+            last_end = after1;
+            search_start = after1;
+            continue;
+        }
+        search_start = after;
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// \ketbra{x}{y} → |x⟩⟨y|
+fn convert_ketbra(text: &str) -> String {
+    let pattern = "\\ketbra";
+    let mut result = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut last_end = 0;
+    let mut search_start = 0;
+
+    while let Some(pos) = text[search_start..].find(pattern) {
+        let abs_pos = search_start + pos;
+        let after = abs_pos + pattern.len();
+
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+
+        if let Some((cs1, ce1, after1)) = extract_command_arg(text, after) {
+            if let Some((cs2, ce2, after2)) = extract_command_arg(text, after1) {
+                result.push_str(&text[last_end..abs_pos]);
+                result.push('|');
+                result.push_str(&text[cs1..ce1]);
+                result.push('\u{27E9}');
+                result.push('\u{27E8}');
+                result.push_str(&text[cs2..ce2]);
+                result.push('|');
+                last_end = after2;
+                search_start = after2;
+                continue;
+            }
+        }
+        search_start = after;
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
 /// Replace `\cmd` followed by uppercase letter with a space.
 fn replace_cmd_before_upper(text: &str, cmd_name: &str) -> String {
     let pattern = format!("\\{}", cmd_name);
@@ -505,8 +970,191 @@ mod tests {
 
     #[test]
     fn test_textsuperscript_letter_passthrough() {
-        // Letters without Unicode superscript equivalents pass through
         let result = convert_formatting(r"\textsuperscript{a}");
         assert_eq!(result, "a");
+    }
+
+    #[test]
+    fn test_tolerant_unclosed_brace() {
+        let result = convert_formatting("\\textbf{unclosed text");
+        assert!(
+            result.contains("unclosed text"),
+            "tolerant should preserve content: {result}"
+        );
+    }
+
+    #[test]
+    fn test_ensuremath_unwrap() {
+        let result = convert_formatting(r"\ensuremath{x}");
+        assert_eq!(result, "x");
+    }
+
+    #[test]
+    fn test_texorpdfstring() {
+        let result = convert_formatting(r"\texorpdfstring{$\alpha$}{alpha}");
+        assert_eq!(result, "alpha");
+    }
+
+    #[test]
+    fn test_frac_outside_math() {
+        let result = convert_formatting(r"\frac{a}{b}");
+        assert_eq!(result, "a/b");
+    }
+
+    #[test]
+    fn test_dfrac_outside_math() {
+        let result = convert_formatting(r"\dfrac{1}{2}");
+        assert_eq!(result, "1/2");
+    }
+
+    #[test]
+    fn test_frac_inside_math_preserved() {
+        let result = convert_formatting(r"$\frac{a}{b}$");
+        assert_eq!(result, r"$\frac{a}{b}$");
+    }
+
+    #[test]
+    fn test_sqrt_outside_math() {
+        let result = convert_formatting(r"\sqrt{x}");
+        assert_eq!(result, "\u{221A}(x)");
+    }
+
+    #[test]
+    fn test_sqrt_with_optional() {
+        let result = convert_formatting(r"\sqrt[3]{x}");
+        assert_eq!(result, "\u{221A}[3](x)");
+    }
+
+    #[test]
+    fn test_sqrt_inside_math_preserved() {
+        let result = convert_formatting(r"$\sqrt{x}$");
+        assert_eq!(result, r"$\sqrt{x}$");
+    }
+
+    #[test]
+    fn test_binom_outside_math() {
+        let result = convert_formatting(r"\binom{n}{k}");
+        assert_eq!(result, "C(n,k)");
+    }
+
+    #[test]
+    fn test_binom_inside_math_preserved() {
+        let result = convert_formatting(r"$\binom{n}{k}$");
+        assert_eq!(result, r"$\binom{n}{k}$");
+    }
+
+    #[test]
+    fn test_hat_single_char() {
+        let result = convert_formatting(r"\hat{x}");
+        assert_eq!(result, "x\u{0302}");
+    }
+
+    #[test]
+    fn test_vec_single_char() {
+        let result = convert_formatting(r"\vec{v}");
+        assert_eq!(result, "v\u{20D7}");
+    }
+
+    #[test]
+    fn test_accent_multi_char_unwraps() {
+        let result = convert_formatting(r"\hat{abc}");
+        assert_eq!(result, "abc");
+    }
+
+    #[test]
+    fn test_overline_single_char() {
+        let result = convert_formatting(r"\overline{x}");
+        assert_eq!(result, "x\u{0305}");
+    }
+
+    #[test]
+    fn test_underline_single_char() {
+        let result = convert_formatting(r"\underline{x}");
+        assert_eq!(result, "x\u{0332}");
+    }
+
+    #[test]
+    fn test_verb_pipe() {
+        let result = convert_formatting(r"\verb|hello world|");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_verb_star() {
+        let result = convert_formatting(r"\verb*|code here|");
+        assert_eq!(result, "code here");
+    }
+
+    #[test]
+    fn test_verb_bang_delimiter() {
+        let result = convert_formatting(r"\verb!special!");
+        assert_eq!(result, "special");
+    }
+
+    #[test]
+    fn test_verb_boundary() {
+        // \verbatim should NOT match as \verb
+        let result = convert_formatting(r"\verbatim{text}");
+        assert!(result.contains("verbatim") || result.contains("text"));
+    }
+
+    #[test]
+    fn test_lstinline_braced() {
+        let result = convert_formatting(r"\lstinline{x = 1}");
+        assert_eq!(result, "x = 1");
+    }
+
+    #[test]
+    fn test_lstinline_delimiter() {
+        let result = convert_formatting(r"\lstinline|x = 1|");
+        assert_eq!(result, "x = 1");
+    }
+
+    #[test]
+    fn test_mintinline() {
+        let result = convert_formatting(r"\mintinline{python}{x = 1}");
+        assert_eq!(result, "x = 1");
+    }
+
+    #[test]
+    fn test_ket() {
+        let result = convert_formatting(r"\ket{0}");
+        assert!(result.contains("|") && result.contains("\u{27E9}"), "ket: {result}");
+    }
+
+    #[test]
+    fn test_bra() {
+        let result = convert_formatting(r"\bra{0}");
+        assert!(result.contains("\u{27E8}") && result.contains("|"), "bra: {result}");
+    }
+
+    #[test]
+    fn test_braket() {
+        let result = convert_formatting(r"\braket{x}{y}");
+        assert!(result.contains("\u{27E8}") && result.contains("|") && result.contains("\u{27E9}"), "braket: {result}");
+    }
+
+    #[test]
+    fn test_ketbra() {
+        let result = convert_formatting(r"\ketbra{x}{y}");
+        assert!(result.contains("|x\u{27E9}") && result.contains("\u{27E8}y|"), "ketbra: {result}");
+    }
+
+    #[test]
+    fn test_dddot_single_char() {
+        let result = convert_formatting(r"\dddot{x}");
+        assert!(result.contains("x") && result.contains("\u{20DB}"), "dddot: {result}");
+    }
+
+    #[test]
+    fn test_ddddot_single_char() {
+        let result = convert_formatting(r"\ddddot{x}");
+        assert!(result.contains("x") && result.contains("\u{20DC}"), "ddddot: {result}");
+    }
+
+    #[test]
+    fn test_endnote() {
+        let result = convert_formatting(r"text\endnote{a note}more");
+        assert_eq!(result, "text a note more");
     }
 }
