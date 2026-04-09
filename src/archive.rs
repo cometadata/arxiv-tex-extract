@@ -1,4 +1,5 @@
 use crate::input_resolve::TexFile;
+use crate::result::FileType;
 use anyhow::{Context, Result};
 use std::io::Read;
 
@@ -6,10 +7,57 @@ use std::io::Read;
 pub struct PaperArchive {
     pub arxiv_id: String,
     pub tex_files: Vec<TexFile>,
+    pub file_type: FileType,
+    pub entry_name: String,
 }
 
 /// Maximum decompressed size per archive (100MB).
 const MAX_DECOMPRESSED_SIZE: u64 = 100_000_000;
+
+/// Detect file type from the first bytes of decompressed content.
+fn detect_file_type(bytes: &[u8]) -> FileType {
+    if bytes.is_empty() {
+        return FileType::Unknown;
+    }
+    if bytes.starts_with(b"%PDF") {
+        FileType::Pdf
+    } else if bytes.starts_with(b"%!PS") {
+        FileType::Postscript
+    } else {
+        // 15 bytes accommodates "<!doctype html>" (longest prefix we check).
+        let prefix = &bytes[..bytes.len().min(15)];
+        if (prefix.len() >= 5 && prefix[..5].eq_ignore_ascii_case(b"<html"))
+            || (prefix.len() >= 9 && prefix[..9].eq_ignore_ascii_case(b"<!doctype"))
+        {
+            FileType::Html
+        } else {
+            FileType::Tex
+        }
+    }
+}
+
+/// Decompress gz bytes and classify: if tex, return the tex file; otherwise return the detected type.
+fn classify_gz(raw: &[u8], arxiv_id: &str) -> (Vec<TexFile>, FileType) {
+    match decompress_gz(raw, arxiv_id) {
+        Ok(decompressed) => {
+            let ft = detect_file_type(&decompressed);
+            if ft == FileType::Tex {
+                let tex_files = if let Some(content) = decode_bytes(&decompressed) {
+                    vec![TexFile {
+                        name: format!("{}.tex", arxiv_id),
+                        content,
+                    }]
+                } else {
+                    Vec::new()
+                };
+                (tex_files, FileType::Tex)
+            } else {
+                (Vec::new(), ft)
+            }
+        }
+        Err(_) => (Vec::new(), FileType::Unknown),
+    }
+}
 
 /// Process papers from an outer tar file one at a time via callback.
 ///
@@ -45,6 +93,12 @@ pub fn for_each_paper(reader: impl Read, mut f: impl FnMut(Result<PaperArchive>)
             Err(_) => continue,
         };
 
+        // Skip directory entries (e.g. "2603/") — they are tar metadata,
+        // not paper submissions.
+        if path.ends_with('/') {
+            continue;
+        }
+
         let arxiv_id = derive_arxiv_id(&path);
         f(process_entry(entry, &arxiv_id, &path));
     }
@@ -79,25 +133,26 @@ fn process_entry<R: Read>(mut entry: tar::Entry<R>, arxiv_id: &str, path: &str) 
         .read_to_end(&mut raw_bytes)
         .with_context(|| format!("reading entry {}", path))?;
 
-    let tex_files = if path.ends_with(".tar.gz") || path.ends_with(".tgz") || path.ends_with(".gz") {
-        // Try as gzipped tar first. If that yields no .tex files, also try
-        // as a single gzipped .tex — some arXiv .tar.gz entries are just
-        // gzipped tex files that the tar crate silently returns zero entries for.
-        // Old arXiv .gz entries are often gzipped tar archives (multi-file
-        // submissions) despite the plain .gz extension.
+    let (tex_files, file_type) = if path.ends_with(".pdf") {
+        (Vec::new(), FileType::Pdf)
+    } else if path.ends_with(".tar.gz") || path.ends_with(".tgz") || path.ends_with(".gz") {
+        // Try as gzipped tar first. Old arXiv .gz entries are often gzipped
+        // tar archives (multi-file submissions) despite the plain .gz extension.
         match extract_inner_tar_gz(&raw_bytes, arxiv_id) {
-            Ok(files) if !files.is_empty() => files,
-            _ => extract_single_gz(&raw_bytes, arxiv_id).unwrap_or_default(),
+            Ok(files) if !files.is_empty() => (files, FileType::Tex),
+            _ => classify_gz(&raw_bytes, arxiv_id),
         }
     } else if path.ends_with(".tex") {
-        extract_single_tex(&raw_bytes, path)?
+        (extract_single_tex(&raw_bytes, path)?, FileType::Tex)
     } else {
-        Vec::new()
+        (Vec::new(), FileType::Unknown)
     };
 
     Ok(PaperArchive {
         arxiv_id: arxiv_id.to_string(),
         tex_files,
+        file_type,
+        entry_name: path.to_string(),
     })
 }
 
@@ -148,8 +203,8 @@ fn extract_inner_tar_gz(raw: &[u8], arxiv_id: &str) -> Result<Vec<TexFile>> {
     Ok(tex_files)
 }
 
-/// Extract a single .tex file from a .gz archive.
-fn extract_single_gz(raw: &[u8], arxiv_id: &str) -> Result<Vec<TexFile>> {
+/// Decompress a .gz archive to raw bytes.
+fn decompress_gz(raw: &[u8], arxiv_id: &str) -> Result<Vec<u8>> {
     let gz = flate2::read::GzDecoder::new(raw);
     let mut limited = gz.take(MAX_DECOMPRESSED_SIZE);
 
@@ -158,14 +213,7 @@ fn extract_single_gz(raw: &[u8], arxiv_id: &str) -> Result<Vec<TexFile>> {
         .read_to_end(&mut content_bytes)
         .with_context(|| format!("decompressing gz for {}", arxiv_id))?;
 
-    if let Some(content) = decode_bytes(&content_bytes) {
-        Ok(vec![TexFile {
-            name: format!("{}.tex", arxiv_id),
-            content,
-        }])
-    } else {
-        Ok(Vec::new())
-    }
+    Ok(content_bytes)
 }
 
 /// Extract a single .tex file from raw bytes.
@@ -206,6 +254,7 @@ fn derive_arxiv_id(path: &str) -> String {
         .trim_end_matches(".tgz")
         .trim_end_matches(".gz")
         .trim_end_matches(".tex")
+        .trim_end_matches(".pdf")
         .to_string()
 }
 
@@ -224,23 +273,23 @@ pub fn load_paper_archive(file_path: &std::path::Path) -> Result<PaperArchive> {
 
     let path_str = file_path.to_string_lossy().to_string();
 
-    let tex_files = if path_str.ends_with(".tar.gz") || path_str.ends_with(".tgz") || path_str.ends_with(".gz") {
+    let (tex_files, file_type) = if path_str.ends_with(".pdf") {
+        (Vec::new(), FileType::Pdf)
+    } else if path_str.ends_with(".tar.gz") || path_str.ends_with(".tgz") || path_str.ends_with(".gz") {
         match extract_from_tar(&raw, &arxiv_id) {
-            Ok(files) if !files.is_empty() => files,
-            _ => {
-                match extract_inner_tar_gz(&raw, &arxiv_id) {
-                    Ok(files) if !files.is_empty() => files,
-                    _ => extract_single_gz(&raw, &arxiv_id)?,
-                }
-            }
+            Ok(files) if !files.is_empty() => (files, FileType::Tex),
+            _ => match extract_inner_tar_gz(&raw, &arxiv_id) {
+                Ok(files) if !files.is_empty() => (files, FileType::Tex),
+                _ => classify_gz(&raw, &arxiv_id),
+            },
         }
     } else if path_str.ends_with(".tex") {
-        extract_single_tex(&raw, &path_str)?
+        (extract_single_tex(&raw, &path_str)?, FileType::Tex)
     } else {
-        Vec::new()
+        (Vec::new(), FileType::Unknown)
     };
 
-    Ok(PaperArchive { arxiv_id, tex_files })
+    Ok(PaperArchive { arxiv_id, tex_files, file_type, entry_name: path_str })
 }
 
 /// Try to extract .tex files from raw bytes treated as a tar archive.
@@ -302,5 +351,40 @@ mod tests {
         let mut bytes = vec![0xEF, 0xBB, 0xBF]; // BOM
         bytes.extend_from_slice("hello".as_bytes());
         assert_eq!(decode_bytes(&bytes).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_detect_file_type_empty() {
+        assert_eq!(detect_file_type(b""), FileType::Unknown);
+    }
+
+    #[test]
+    fn test_detect_file_type_pdf() {
+        assert_eq!(detect_file_type(b"%PDF-1.4 fake pdf"), FileType::Pdf);
+    }
+
+    #[test]
+    fn test_detect_file_type_postscript() {
+        assert_eq!(detect_file_type(b"%!PS-Adobe-3.0"), FileType::Postscript);
+    }
+
+    #[test]
+    fn test_detect_file_type_html_doctype() {
+        assert_eq!(detect_file_type(b"<!DOCTYPE html>"), FileType::Html);
+        assert_eq!(detect_file_type(b"<!doctype html>"), FileType::Html);
+    }
+
+    #[test]
+    fn test_detect_file_type_html_tag() {
+        assert_eq!(detect_file_type(b"<html>"), FileType::Html);
+        assert_eq!(detect_file_type(b"<HTML>"), FileType::Html);
+    }
+
+    #[test]
+    fn test_detect_file_type_tex() {
+        assert_eq!(
+            detect_file_type(b"\\documentclass{article}"),
+            FileType::Tex
+        );
     }
 }

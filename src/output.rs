@@ -25,6 +25,8 @@ pub fn result_schema() -> Schema {
         Field::new("total_time_us", DataType::UInt64, true),
         Field::new("peak_memory_bytes", DataType::UInt64, true),
         Field::new("outer_tar", DataType::Utf8, true),
+        Field::new("file_type", DataType::Utf8, true),
+        Field::new("entry_name", DataType::Utf8, true),
         Field::new("shard_id", DataType::Utf8, false),
     ])
 }
@@ -143,6 +145,8 @@ impl ParquetShardWriter {
         let mut total_times = UInt64Builder::with_capacity(len);
         let mut peak_memories = UInt64Builder::with_capacity(len);
         let mut outer_tars = StringBuilder::with_capacity(len, len * 20);
+        let mut file_types = StringBuilder::with_capacity(len, len * 10);
+        let mut entry_names = StringBuilder::with_capacity(len, len * 30);
         let mut shard_ids = StringBuilder::with_capacity(len, len * 20);
 
         for r in &self.buffer {
@@ -156,6 +160,8 @@ impl ParquetShardWriter {
             append_option_u64(&mut total_times, r.total_time_us);
             append_option_u64(&mut peak_memories, r.peak_memory_bytes);
             append_option_str(&mut outer_tars, r.source_tar.as_deref());
+            append_option_str(&mut file_types, r.file_type.map(|ft| ft.as_str()));
+            append_option_str(&mut entry_names, r.entry_name.as_deref());
             shard_ids.append_value(shard_id);
         }
 
@@ -170,6 +176,8 @@ impl ParquetShardWriter {
             Arc::new(total_times.finish()),
             Arc::new(peak_memories.finish()),
             Arc::new(outer_tars.finish()),
+            Arc::new(file_types.finish()),
+            Arc::new(entry_names.finish()),
             Arc::new(shard_ids.finish()),
         ];
 
@@ -219,6 +227,7 @@ fn append_option_u64(builder: &mut UInt64Builder, val: Option<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::result::FileType;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     fn make_result(id: &str, text: &str) -> ExtractionResult {
@@ -233,6 +242,8 @@ mod tests {
             stage_timings_us: Some(r#"{"cleanup":42}"#.into()),
             total_time_us: Some(42),
             peak_memory_bytes: None,
+            file_type: Some(FileType::Tex),
+            entry_name: Some("2603/test.gz".into()),
         }
     }
 
@@ -248,6 +259,8 @@ mod tests {
             stage_timings_us: None,
             total_time_us: None,
             peak_memory_bytes: None,
+            file_type: None,
+            entry_name: None,
         }
     }
 
@@ -273,7 +286,7 @@ mod tests {
         let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 2);
-        assert_eq!(batches[0].num_columns(), 11);
+        assert_eq!(batches[0].num_columns(), 13);
     }
 
     #[test]
@@ -317,6 +330,6 @@ mod tests {
     #[test]
     fn test_schema_field_count() {
         let schema = result_schema();
-        assert_eq!(schema.fields().len(), 11);
+        assert_eq!(schema.fields().len(), 13);
     }
 }
