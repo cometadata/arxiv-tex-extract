@@ -70,10 +70,6 @@ const SPACE_BEFORE_UPPER: &[&str] = &[
 static FOOTNOTE_MARK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\footnotemark").unwrap());
 
-// ---------------------------------------------------------------------------
-// Inline verbatim handling (Stage 0 — runs before other formatting)
-// ---------------------------------------------------------------------------
-
 /// Handle `\verb|...|` and `\verb*|...|` — delimiter-aware inline verbatim.
 /// The delimiter is the first non-whitespace character after `\verb` (or `\verb*`).
 fn convert_inline_verb(text: &str) -> String {
@@ -222,10 +218,6 @@ fn convert_mintinline(text: &str) -> String {
     result
 }
 
-// ---------------------------------------------------------------------------
-// Math accent combining marks (Stage 2d)
-// ---------------------------------------------------------------------------
-
 /// Math accent commands mapped to their Unicode combining marks.
 const MATH_ACCENT_MAP: &[(&str, char)] = &[
     ("hat",       '\u{0302}'), // COMBINING CIRCUMFLEX
@@ -293,10 +285,6 @@ fn apply_math_accent(text: &str, cmd_name: &str, combining: char) -> String {
     result.push_str(&text[last_end..]);
     result
 }
-
-// ---------------------------------------------------------------------------
-// Math expression text conversion (Stage 2a-c)
-// ---------------------------------------------------------------------------
 
 static FRAC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\(?:d|t|nice|c)?frac").unwrap());
@@ -424,10 +412,6 @@ fn convert_text_binom(text: &str) -> String {
     result.push_str(&text[last_end..]);
     result
 }
-
-// ---------------------------------------------------------------------------
-// Main conversion entry point
-// ---------------------------------------------------------------------------
 
 /// Convert LaTeX inline formatting to plaintext/markdown.
 pub fn convert_formatting(text: &str) -> String {
@@ -766,10 +750,6 @@ fn strip_command_entirely(text: &str, cmd_name: &str) -> String {
     result
 }
 
-// ---------------------------------------------------------------------------
-// Quantum notation (Dirac bra-ket)
-// ---------------------------------------------------------------------------
-
 /// Convert \ket{x} → |x⟩, \bra{x} → ⟨x|, \braket{x}{y} → ⟨x|y⟩, \ketbra{x}{y} → |x⟩⟨y|
 fn convert_quantum_notation(text: &str) -> String {
     let mut result = text.to_string();
@@ -1003,8 +983,6 @@ mod tests {
         );
     }
 
-    // --- Stage 1c tests ---
-
     #[test]
     fn test_ensuremath_unwrap() {
         let result = convert_formatting(r"\ensuremath{x}");
@@ -1016,8 +994,6 @@ mod tests {
         let result = convert_formatting(r"\texorpdfstring{$\alpha$}{alpha}");
         assert_eq!(result, "alpha");
     }
-
-    // --- Stage 2a-c tests ---
 
     #[test]
     fn test_frac_outside_math() {
@@ -1067,8 +1043,6 @@ mod tests {
         assert_eq!(result, r"$\binom{n}{k}$");
     }
 
-    // --- Stage 2d tests ---
-
     #[test]
     fn test_hat_single_char() {
         let result = convert_formatting(r"\hat{x}");
@@ -1098,8 +1072,6 @@ mod tests {
         let result = convert_formatting(r"\underline{x}");
         assert_eq!(result, "x\u{0332}");
     }
-
-    // --- Inline verbatim tests ---
 
     #[test]
     fn test_verb_pipe() {
@@ -1144,8 +1116,6 @@ mod tests {
         assert_eq!(result, "x = 1");
     }
 
-    // --- Quantum notation tests ---
-
     #[test]
     fn test_ket() {
         let result = convert_formatting(r"\ket{0}");
@@ -1170,8 +1140,6 @@ mod tests {
         assert!(result.contains("|x\u{27E9}") && result.contains("\u{27E8}y|"), "ketbra: {result}");
     }
 
-    // --- Diacritic additions ---
-
     #[test]
     fn test_dddot_single_char() {
         let result = convert_formatting(r"\dddot{x}");
@@ -1183,8 +1151,6 @@ mod tests {
         let result = convert_formatting(r"\ddddot{x}");
         assert!(result.contains("x") && result.contains("\u{20DC}"), "ddddot: {result}");
     }
-
-    // --- Endnote test ---
 
     #[test]
     fn test_endnote() {

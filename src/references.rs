@@ -410,8 +410,6 @@ mod tests {
         convert_references(text, &HashMap::new())
     }
 
-    // --- Citation resolution with numeric indices ---
-
     #[test]
     fn test_cite_with_bibitem_resolves_to_number() {
         let input = r"\cite{smith2020} text \bibitem{smith2020} A reference.";
@@ -464,8 +462,6 @@ mod tests {
         assert!(result.contains("[2]"), "second bibitem should be [2]: {result}");
     }
 
-    // --- Cross-reference resolution ---
-
     #[test]
     fn test_ref_with_label_resolves() {
         let input = r"\label{fig:x} \ref{fig:x}";
@@ -492,8 +488,6 @@ mod tests {
         assert_eq!(result, " Introduction");
     }
 
-    // --- URL / href ---
-
     #[test]
     fn test_url() {
         let result = cr(r"\url{https://example.com}");
@@ -506,8 +500,6 @@ mod tests {
         assert_eq!(result, "click here");
     }
 
-    // --- Boundary checks ---
-
     #[test]
     fn test_citation_not_matching_longer() {
         let result = cr(r"\citation{x}");
@@ -519,8 +511,6 @@ mod tests {
         let result = cr(r"\bibitemize{x}");
         assert_eq!(result, r"\bibitemize{x}");
     }
-
-    // --- Journal macros ---
 
     #[test]
     fn test_journal_macro_apj() {

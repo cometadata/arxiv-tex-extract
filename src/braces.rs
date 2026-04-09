@@ -290,8 +290,6 @@ mod tests {
         assert_eq!(&s[cs..ce], r"\textbf{A \emph{very \textit{important}} paper}");
     }
 
-    // --- tolerant brace matching ---
-
     #[test]
     fn test_tolerant_matched_delegates_to_strict() {
         let s = "{hello}";
@@ -339,8 +337,6 @@ mod tests {
         assert_eq!(&s[cs..ce], "unclosed text");
         assert_eq!(after, s.len()); // at end of string, no } to skip
     }
-
-    // --- extract_optional_arg ---
 
     #[test]
     fn test_extract_optional_arg_present() {

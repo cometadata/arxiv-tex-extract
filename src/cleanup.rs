@@ -27,10 +27,6 @@ const FONT_SWITCHES: &[&str] = &[
     "rmfamily", "ttfamily",
 ];
 
-// ---------------------------------------------------------------------------
-// Pre-diacritic stripping (runs BEFORE convert_diacritics)
-// ---------------------------------------------------------------------------
-
 /// TeX spacing commands that take a dimension argument and collide with
 /// single-letter diacritic accents (e.g. `\vskip` vs `\v`, `\kern` vs `\k`).
 static SPACING_DIM_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -181,10 +177,6 @@ fn strip_command_with_args(text: &str, cmd_name: &str, n_args: usize) -> String 
     result.push_str(&text[last_end..]);
     result
 }
-
-// ---------------------------------------------------------------------------
-// Math-region detection (used to protect math from cleanup transforms)
-// ---------------------------------------------------------------------------
 
 /// Identify byte ranges of math regions: `$...$`, `$$...$$`, `\(...\)`, `\[...\]`,
 /// and named math environments like `\begin{equation}...\end{equation}`.

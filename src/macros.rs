@@ -577,8 +577,6 @@ mod tests {
         );
     }
 
-    // --- providecommand support ---
-
     #[test]
     fn test_collect_providecommand() {
         let input = r"\providecommand{\foo}{bar}";
@@ -592,8 +590,6 @@ mod tests {
         let macros = collect_macros(input);
         assert_eq!(macros.get("\\foo").unwrap(), "bar");
     }
-
-    // --- parametric macro collection ---
 
     #[test]
     fn test_collect_parametric_newcommand() {
@@ -665,8 +661,6 @@ mod tests {
         let simple = collect_macros(input);
         assert!(simple.is_empty(), "collect_macros should skip parametric");
     }
-
-    // --- parametric macro expansion ---
 
     #[test]
     fn test_expand_parametric_single_arg() {
@@ -813,8 +807,6 @@ mod tests {
         let result = substitute_args("#1 and #2", &args);
         assert_eq!(result, "#2 and real2");
     }
-
-    // --- shorthand normalization ---
 
     #[test]
     fn test_normalize_shorthands_be() {

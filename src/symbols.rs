@@ -50,10 +50,6 @@ impl CommandReplacer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Symbol tables
-// ---------------------------------------------------------------------------
-
 static TEXT_COMMANDS: LazyLock<CommandReplacer> = LazyLock::new(|| {
     CommandReplacer::new(&[
         ("\\textbackslash", "\\"),
@@ -103,7 +99,6 @@ static TEXT_COMMANDS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         // Inverted punctuation
         ("\\textexclamdown", "\u{00A1}"),
         ("\\textquestiondown", "\u{00BF}"),
-        // --- Additional text commands ---
         ("\\textmu", "\u{00B5}"),
         ("\\textcelsius", "\u{2103}"),
         ("\\textonesuperior", "\u{00B9}"),
@@ -361,7 +356,6 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\varinjlim", "inj lim"),
         // Package-defined symbols
         ("\\lambdabar", "\u{019B}"),
-        // --- Additional dot variants ---
         ("\\vdots", "\u{22EE}"),
         ("\\ddots", "\u{22F1}"),
         ("\\iddots", "\u{22F0}"),
@@ -371,7 +365,6 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\dotsm", "\u{2026}"),
         ("\\dotsi", "\u{2026}"),
         ("\\dotso", "\u{2026}"),
-        // --- Circled / boxed operators ---
         ("\\ominus", "\u{2296}"),
         ("\\oslash", "\u{2298}"),
         ("\\circledcirc", "\u{229A}"),
@@ -381,7 +374,6 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\boxminus", "\u{229F}"),
         ("\\boxtimes", "\u{22A0}"),
         ("\\boxdot", "\u{22A1}"),
-        // --- Additional binary operators ---
         ("\\ltimes", "\u{22C9}"),
         ("\\rtimes", "\u{22CA}"),
         ("\\leftthreetimes", "\u{22CB}"),
@@ -391,7 +383,6 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\dotplus", "\u{2214}"),
         ("\\intercal", "\u{22BA}"),
         ("\\uplus", "\u{228E}"),
-        // --- Turnstile variants ---
         ("\\Vdash", "\u{22A9}"),
         ("\\Vvdash", "\u{22AA}"),
         ("\\VDash", "\u{22AB}"),
@@ -399,7 +390,6 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\nvDash", "\u{22AD}"),
         ("\\nVdash", "\u{22AE}"),
         ("\\nVDash", "\u{22AF}"),
-        // --- Extended comparisons ---
         ("\\approxeq", "\u{224A}"),
         ("\\triangleq", "\u{225C}"),
         ("\\Bumpeq", "\u{224E}"),
@@ -435,7 +425,6 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\gnapprox", "\u{2A8A}"),
         ("\\lesseqqgtr", "\u{2A8B}"),
         ("\\gtreqqless", "\u{2A8C}"),
-        // --- Base comparison gaps ---
         ("\\lessgtr", "\u{2276}"),
         ("\\gtrless", "\u{2277}"),
         ("\\precsim", "\u{227E}"),
@@ -443,7 +432,6 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\leqq", "\u{2266}"),
         ("\\geqq", "\u{2267}"),
         ("\\backsim", "\u{223D}"),
-        // --- Extended set operations ---
         ("\\sqcap", "\u{2293}"),
         ("\\sqcup", "\u{2294}"),
         ("\\Cap", "\u{22D2}"),
@@ -457,15 +445,12 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\supsetneqq", "\u{2ACC}"),
         ("\\subsetneq", "\u{228A}"),
         ("\\supsetneq", "\u{228B}"),
-        // --- Logic operators ---
         ("\\veebar", "\u{22BB}"),
         ("\\curlyvee", "\u{22CE}"),
         ("\\curlywedge", "\u{22CF}"),
         ("\\barwedge", "\u{2305}"),
-        // --- Negated triangle relations ---
         ("\\ntrianglelefteq", "\u{22EC}"),
         ("\\ntrianglerighteq", "\u{22ED}"),
-        // --- Additional arrows ---
         ("\\nleftarrow", "\u{219A}"),
         ("\\nrightarrow", "\u{219B}"),
         ("\\nleftrightarrow", "\u{21AE}"),
@@ -488,7 +473,6 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\rightrightarrows", "\u{21C9}"),
         ("\\upuparrows", "\u{21C8}"),
         ("\\downdownarrows", "\u{21CA}"),
-        // --- Geometric shapes ---
         ("\\blacksquare", "\u{25A0}"),
         ("\\blacktriangle", "\u{25B4}"),
         ("\\blacktriangledown", "\u{25BE}"),
@@ -504,7 +488,6 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\llcorner", "\u{231E}"),
         ("\\lrcorner", "\u{231F}"),
         ("\\circledS", "\u{24C8}"),
-        // --- Misc ---
         ("\\surd", "\u{221A}"),
         ("\\hslash", "\u{210F}"),
         ("\\mho", "\u{2127}"),
@@ -583,10 +566,6 @@ static GREEK_LETTERS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\upomega", "\u{03c9}"),
     ])
 });
-
-// ---------------------------------------------------------------------------
-// Unicode math font converters (Stage 3)
-// ---------------------------------------------------------------------------
 
 /// Map `\mathbb{X}` or `\Bbb{X}` to Unicode double-struck characters.
 /// Full A-Z, a-z, 0-9 mapping.
@@ -732,10 +711,6 @@ fn mathtt_char(ch: char) -> char {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Inverted punctuation (Stage 4f)
-// ---------------------------------------------------------------------------
-
 /// Convert `!`` → ¡ and `?`` → ¿ (TeX inverted punctuation convention).
 /// Only when NOT followed by another backtick (to avoid interfering with ``).
 fn replace_inverted_punct(text: &str) -> String {
@@ -765,10 +740,6 @@ fn replace_inverted_punct(text: &str) -> String {
     }
     result
 }
-
-// ---------------------------------------------------------------------------
-// Main conversion entry point
-// ---------------------------------------------------------------------------
 
 /// Convert LaTeX symbol commands and ligatures to Unicode.
 pub fn convert_symbols(text: &str) -> String {
