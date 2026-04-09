@@ -103,6 +103,19 @@ static TEXT_COMMANDS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         // Inverted punctuation
         ("\\textexclamdown", "\u{00A1}"),
         ("\\textquestiondown", "\u{00BF}"),
+        // --- Additional text commands ---
+        ("\\textmu", "\u{00B5}"),
+        ("\\textcelsius", "\u{2103}"),
+        ("\\textonesuperior", "\u{00B9}"),
+        ("\\texttwosuperior", "\u{00B2}"),
+        ("\\textthreesuperior", "\u{00B3}"),
+        ("\\textdiv", "\u{00F7}"),
+        ("\\textlnot", "\u{00AC}"),
+        ("\\guillemotleft", "\u{00AB}"),
+        ("\\guillemotright", "\u{00BB}"),
+        ("\\quotedblbase", "\u{201E}"),
+        ("\\quotesinglbase", "\u{201A}"),
+        ("\\textohm", "\u{2126}"),
     ])
 });
 
@@ -348,6 +361,154 @@ static MATH_SYMBOLS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\varinjlim", "inj lim"),
         // Package-defined symbols
         ("\\lambdabar", "\u{019B}"),
+        // --- Additional dot variants ---
+        ("\\vdots", "\u{22EE}"),
+        ("\\ddots", "\u{22F1}"),
+        ("\\iddots", "\u{22F0}"),
+        ("\\udots", "\u{22F0}"),
+        ("\\dotsc", "\u{2026}"),
+        ("\\dotsb", "\u{2026}"),
+        ("\\dotsm", "\u{2026}"),
+        ("\\dotsi", "\u{2026}"),
+        ("\\dotso", "\u{2026}"),
+        // --- Circled / boxed operators ---
+        ("\\ominus", "\u{2296}"),
+        ("\\oslash", "\u{2298}"),
+        ("\\circledcirc", "\u{229A}"),
+        ("\\circledast", "\u{229B}"),
+        ("\\circleddash", "\u{229D}"),
+        ("\\boxplus", "\u{229E}"),
+        ("\\boxminus", "\u{229F}"),
+        ("\\boxtimes", "\u{22A0}"),
+        ("\\boxdot", "\u{22A1}"),
+        // --- Additional binary operators ---
+        ("\\ltimes", "\u{22C9}"),
+        ("\\rtimes", "\u{22CA}"),
+        ("\\leftthreetimes", "\u{22CB}"),
+        ("\\rightthreetimes", "\u{22CC}"),
+        ("\\divideontimes", "\u{22C7}"),
+        ("\\smallsetminus", "\u{2216}"),
+        ("\\dotplus", "\u{2214}"),
+        ("\\intercal", "\u{22BA}"),
+        ("\\uplus", "\u{228E}"),
+        // --- Turnstile variants ---
+        ("\\Vdash", "\u{22A9}"),
+        ("\\Vvdash", "\u{22AA}"),
+        ("\\VDash", "\u{22AB}"),
+        ("\\nvdash", "\u{22AC}"),
+        ("\\nvDash", "\u{22AD}"),
+        ("\\nVdash", "\u{22AE}"),
+        ("\\nVDash", "\u{22AF}"),
+        // --- Extended comparisons ---
+        ("\\approxeq", "\u{224A}"),
+        ("\\triangleq", "\u{225C}"),
+        ("\\Bumpeq", "\u{224E}"),
+        ("\\bumpeq", "\u{224F}"),
+        ("\\doteqdot", "\u{2251}"),
+        ("\\fallingdotseq", "\u{2252}"),
+        ("\\risingdotseq", "\u{2253}"),
+        ("\\eqcirc", "\u{2256}"),
+        ("\\circeq", "\u{2257}"),
+        ("\\backsimeq", "\u{22CD}"),
+        ("\\between", "\u{226C}"),
+        ("\\lesseqgtr", "\u{22DA}"),
+        ("\\gtreqless", "\u{22DB}"),
+        ("\\lessdot", "\u{22D6}"),
+        ("\\gtrdot", "\u{22D7}"),
+        ("\\eqslantless", "\u{2A95}"),
+        ("\\eqslantgtr", "\u{2A96}"),
+        ("\\curlyeqprec", "\u{22DE}"),
+        ("\\curlyeqsucc", "\u{22DF}"),
+        ("\\preccurlyeq", "\u{227C}"),
+        ("\\succcurlyeq", "\u{227D}"),
+        ("\\lessapprox", "\u{2A85}"),
+        ("\\gtrapprox", "\u{2A86}"),
+        ("\\precapprox", "\u{2AB7}"),
+        ("\\succapprox", "\u{2AB8}"),
+        ("\\precneqq", "\u{2AB5}"),
+        ("\\succneqq", "\u{2AB6}"),
+        ("\\lneq", "\u{2A87}"),
+        ("\\gneq", "\u{2A88}"),
+        ("\\lnsim", "\u{22E6}"),
+        ("\\gnsim", "\u{22E7}"),
+        ("\\lnapprox", "\u{2A89}"),
+        ("\\gnapprox", "\u{2A8A}"),
+        ("\\lesseqqgtr", "\u{2A8B}"),
+        ("\\gtreqqless", "\u{2A8C}"),
+        // --- Base comparison gaps ---
+        ("\\lessgtr", "\u{2276}"),
+        ("\\gtrless", "\u{2277}"),
+        ("\\precsim", "\u{227E}"),
+        ("\\succsim", "\u{227F}"),
+        ("\\leqq", "\u{2266}"),
+        ("\\geqq", "\u{2267}"),
+        ("\\backsim", "\u{223D}"),
+        // --- Extended set operations ---
+        ("\\sqcap", "\u{2293}"),
+        ("\\sqcup", "\u{2294}"),
+        ("\\Cap", "\u{22D2}"),
+        ("\\Cup", "\u{22D3}"),
+        ("\\Subset", "\u{22D0}"),
+        ("\\Supset", "\u{22D1}"),
+        ("\\pitchfork", "\u{22D4}"),
+        ("\\subseteqq", "\u{2AC5}"),
+        ("\\supseteqq", "\u{2AC6}"),
+        ("\\subsetneqq", "\u{2ACB}"),
+        ("\\supsetneqq", "\u{2ACC}"),
+        ("\\subsetneq", "\u{228A}"),
+        ("\\supsetneq", "\u{228B}"),
+        // --- Logic operators ---
+        ("\\veebar", "\u{22BB}"),
+        ("\\curlyvee", "\u{22CE}"),
+        ("\\curlywedge", "\u{22CF}"),
+        ("\\barwedge", "\u{2305}"),
+        // --- Negated triangle relations ---
+        ("\\ntrianglelefteq", "\u{22EC}"),
+        ("\\ntrianglerighteq", "\u{22ED}"),
+        // --- Additional arrows ---
+        ("\\nleftarrow", "\u{219A}"),
+        ("\\nrightarrow", "\u{219B}"),
+        ("\\nleftrightarrow", "\u{21AE}"),
+        ("\\nLeftarrow", "\u{21CD}"),
+        ("\\nRightarrow", "\u{21CF}"),
+        ("\\nLeftrightarrow", "\u{21CE}"),
+        ("\\Lleftarrow", "\u{21DA}"),
+        ("\\Rrightarrow", "\u{21DB}"),
+        ("\\Lsh", "\u{21B0}"),
+        ("\\Rsh", "\u{21B1}"),
+        ("\\looparrowleft", "\u{21AB}"),
+        ("\\looparrowright", "\u{21AC}"),
+        ("\\upharpoonright", "\u{21BE}"),
+        ("\\upharpoonleft", "\u{21BF}"),
+        ("\\downharpoonright", "\u{21C2}"),
+        ("\\downharpoonleft", "\u{21C3}"),
+        ("\\rightleftarrows", "\u{21C4}"),
+        ("\\leftrightarrows", "\u{21C6}"),
+        ("\\leftleftarrows", "\u{21C7}"),
+        ("\\rightrightarrows", "\u{21C9}"),
+        ("\\upuparrows", "\u{21C8}"),
+        ("\\downdownarrows", "\u{21CA}"),
+        // --- Geometric shapes ---
+        ("\\blacksquare", "\u{25A0}"),
+        ("\\blacktriangle", "\u{25B4}"),
+        ("\\blacktriangledown", "\u{25BE}"),
+        ("\\blacktriangleleft", "\u{25C2}"),
+        ("\\blacktriangleright", "\u{25B8}"),
+        ("\\triangledown", "\u{25BF}"),
+        ("\\vartriangle", "\u{25B5}"),
+        ("\\lozenge", "\u{25CA}"),
+        ("\\blacklozenge", "\u{29EB}"),
+        ("\\bigcirc", "\u{25CB}"),
+        ("\\ulcorner", "\u{231C}"),
+        ("\\urcorner", "\u{231D}"),
+        ("\\llcorner", "\u{231E}"),
+        ("\\lrcorner", "\u{231F}"),
+        ("\\circledS", "\u{24C8}"),
+        // --- Misc ---
+        ("\\surd", "\u{221A}"),
+        ("\\hslash", "\u{210F}"),
+        ("\\mho", "\u{2127}"),
+        ("\\Colon", "\u{2237}"),
     ])
 });
 
@@ -393,6 +554,7 @@ static GREEK_LETTERS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\Phi", "\u{03a6}"),
         ("\\Psi", "\u{03a8}"),
         ("\\Omega", "\u{03a9}"),
+        ("\\varkappa", "\u{03F0}"),
         ("\\digamma", "\u{03DD}"),
         ("\\Digamma", "\u{03DC}"),
         // Upright Greek (same codepoints — Unicode basic Greek block)
@@ -547,6 +709,29 @@ fn mathsf_char(ch: char) -> char {
     }
 }
 
+/// Map `\mathtt{X}` to Unicode monospace characters.
+fn convert_mathtt(text: &str) -> String {
+    static RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\\mathtt\{([A-Za-z0-9])\}").unwrap());
+    RE.replace_all(text, |caps: &regex::Captures| {
+        let ch = caps.get(1).unwrap().as_str().chars().next().unwrap();
+        mathtt_char(ch).to_string()
+    })
+    .to_string()
+}
+
+fn mathtt_char(ch: char) -> char {
+    match ch {
+        // Uppercase: U+1D670-U+1D689 (contiguous)
+        c @ 'A'..='Z' => char::from_u32(0x1D670 + (c as u32 - 'A' as u32)).unwrap_or(c),
+        // Lowercase: U+1D68A-U+1D6A3 (contiguous)
+        c @ 'a'..='z' => char::from_u32(0x1D68A + (c as u32 - 'a' as u32)).unwrap_or(c),
+        // Digits: U+1D7F6-U+1D7FF (contiguous)
+        c @ '0'..='9' => char::from_u32(0x1D7F6 + (c as u32 - '0' as u32)).unwrap_or(c),
+        c => c,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Inverted punctuation (Stage 4f)
 // ---------------------------------------------------------------------------
@@ -626,6 +811,7 @@ pub fn convert_symbols(text: &str) -> String {
     result = convert_mathcal_mathscr(&result);
     result = convert_mathfrak(&result);
     result = convert_mathsf(&result);
+    result = convert_mathtt(&result);
 
     result
 }
@@ -870,5 +1056,77 @@ mod tests {
     #[test]
     fn test_pipe_delimiter() {
         assert_eq!(convert_symbols("\\|"), "\u{2016}");
+    }
+
+    #[test]
+    fn test_vdots_ddots() {
+        assert_eq!(convert_symbols("\\vdots"), "\u{22EE}");
+        assert_eq!(convert_symbols("\\ddots"), "\u{22F1}");
+    }
+
+    #[test]
+    fn test_boxed_operators() {
+        assert_eq!(convert_symbols("\\boxplus"), "\u{229E}");
+        assert_eq!(convert_symbols("\\boxtimes"), "\u{22A0}");
+    }
+
+    #[test]
+    fn test_turnstile_variants() {
+        assert_eq!(convert_symbols("\\Vdash"), "\u{22A9}");
+        assert_eq!(convert_symbols("\\nvdash"), "\u{22AC}");
+    }
+
+    #[test]
+    fn test_extended_comparisons() {
+        assert_eq!(convert_symbols("\\leqq"), "\u{2266}");
+        assert_eq!(convert_symbols("\\geqq"), "\u{2267}");
+        assert_eq!(convert_symbols("\\preccurlyeq"), "\u{227C}");
+    }
+
+    #[test]
+    fn test_extended_set_ops() {
+        assert_eq!(convert_symbols("\\sqcap"), "\u{2293}");
+        assert_eq!(convert_symbols("\\sqcup"), "\u{2294}");
+        assert_eq!(convert_symbols("\\subsetneq"), "\u{228A}");
+    }
+
+    #[test]
+    fn test_negated_arrows() {
+        assert_eq!(convert_symbols("\\nleftarrow"), "\u{219A}");
+        assert_eq!(convert_symbols("\\nRightarrow"), "\u{21CF}");
+    }
+
+    #[test]
+    fn test_geometric_shapes() {
+        assert_eq!(convert_symbols("\\blacksquare"), "\u{25A0}");
+        assert_eq!(convert_symbols("\\lozenge"), "\u{25CA}");
+        assert_eq!(convert_symbols("\\ulcorner"), "\u{231C}");
+    }
+
+    #[test]
+    fn test_misc_new_symbols() {
+        assert_eq!(convert_symbols("\\surd"), "\u{221A}");
+        assert_eq!(convert_symbols("\\mho"), "\u{2127}");
+        assert_eq!(convert_symbols("\\Colon"), "\u{2237}");
+        assert_eq!(convert_symbols("\\hslash"), "\u{210F}");
+    }
+
+    #[test]
+    fn test_varkappa() {
+        assert_eq!(convert_symbols("\\varkappa"), "\u{03F0}");
+    }
+
+    #[test]
+    fn test_new_text_commands() {
+        assert_eq!(convert_symbols("\\textmu"), "\u{00B5}");
+        assert_eq!(convert_symbols("\\textcelsius"), "\u{2103}");
+        assert_eq!(convert_symbols("\\guillemotleft"), "\u{00AB}");
+    }
+
+    #[test]
+    fn test_mathtt() {
+        assert_eq!(convert_symbols("\\mathtt{A}"), "\u{1D670}");
+        assert_eq!(convert_symbols("\\mathtt{a}"), "\u{1D68A}");
+        assert_eq!(convert_symbols("\\mathtt{0}"), "\u{1D7F6}");
     }
 }

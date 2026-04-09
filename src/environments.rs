@@ -19,10 +19,17 @@ static DISPLAY_MATH_CLOSE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\]").unwrap());
 
 /// List environments
-const LIST_ENVS: &[&str] = &["itemize", "enumerate", "description"];
+const LIST_ENVS: &[&str] = &[
+    "itemize", "enumerate", "description",
+    // paralist package variants
+    "compactitem", "compactenum", "compactdesc", "inparaenum",
+];
 
 /// Figure/table environments (including starred)
-const FLOAT_ENVS: &[&str] = &["figure", "figure*", "table", "table*", "wrapfigure", "wraptable"];
+const FLOAT_ENVS: &[&str] = &[
+    "figure", "figure*", "table", "table*", "wrapfigure", "wraptable",
+    "subfigure", "subfloat", "sidewaysfigure", "sidewaystable",
+];
 
 /// Quote environments
 const QUOTE_ENVS: &[&str] = &["quote", "quotation", "verse"];
@@ -50,6 +57,12 @@ pub(crate) const MATH_ENVS: &[&str] = &[
     "displaymath", "flalign", "flalign*",
     "alignat", "alignat*",
     "math", "dmath", "dmath*",
+    // Inner amsmath environments
+    "split", "cases", "aligned", "gathered", "alignedat",
+    "subequations",
+    // Matrix environments
+    "pmatrix", "bmatrix", "vmatrix", "Bmatrix", "Vmatrix",
+    "smallmatrix", "psmallmatrix", "bsmallmatrix",
 ];
 
 /// Algorithm / pseudocode environments
@@ -73,14 +86,18 @@ const LAYOUT_ENVS: &[&str] = &[
     "minipage", "adjustbox", "adjustwidth",
     "spacing", "singlespace", "doublespace", "onehalfspace",
     "multicols", "multicols*", "widetext",
-    "titlepage",
+    "titlepage", "landscape",
 ];
 
 /// Verbatim / code environments (remove markers, keep content)
 const VERBATIM_ENVS: &[&str] = &["verbatim", "Verbatim", "lstlisting", "minted", "alltt"];
 
 /// Environments to discard entirely (content and markers)
-const DISCARD_ENVS: &[&str] = &["filecontents", "filecontents*"];
+const DISCARD_ENVS: &[&str] = &[
+    "filecontents", "filecontents*",
+    // Drawing / diagram environments (produce garbage text)
+    "tikzpicture", "tikzcd", "pgfpicture", "pspicture", "picture",
+];
 
 /// Convert LaTeX environments to readable form.
 /// `custom_theorems` maps env names (e.g. "dfn") to display names (e.g. "Definition").
@@ -239,8 +256,8 @@ fn convert_items(text: &str) -> String {
 /// Determine the float type category for numbering purposes.
 fn float_type(env_name: &str) -> &str {
     match env_name {
-        "figure" | "figure*" | "wrapfigure" => "figure",
-        "table" | "table*" | "wraptable" => "table",
+        "figure" | "figure*" | "wrapfigure" | "subfigure" | "subfloat" | "sidewaysfigure" => "figure",
+        "table" | "table*" | "wraptable" | "sidewaystable" => "table",
         _ => env_name,
     }
 }
@@ -1011,5 +1028,25 @@ mod tests {
         assert!(result.contains("before"));
         assert!(result.contains("after"));
         assert!(!result.contains("stuff"));
+    }
+
+    #[test]
+    fn test_tikzpicture_discarded() {
+        let input = r"\begin{tikzpicture}
+\draw (0,0) -- (1,1);
+\end{tikzpicture} text after";
+        let result = convert_environments(input, &std::collections::HashMap::new());
+        assert!(!result.contains("draw"), "tikz should be discarded: {result}");
+        assert!(result.contains("text after"));
+    }
+
+    #[test]
+    fn test_compactitem_list() {
+        let input = r"\begin{compactitem}
+\item First
+\item Second
+\end{compactitem}";
+        let result = convert_environments(input, &std::collections::HashMap::new());
+        assert!(result.contains("First") && result.contains("Second"));
     }
 }

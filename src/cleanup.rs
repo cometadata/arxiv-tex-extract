@@ -54,6 +54,7 @@ const NOOP_COMMANDS: &[&str] = &[
     "centering", "sloppy", "fussy", "samepage", "nopagebreak",
     "tableofcontents", "listoffigures", "listoftables",
     "makeatletter", "makeatother", "appendix",
+    "makeindex", "printindex", "printglossary",
 ];
 
 /// Commands whose entire invocation (command + N braced args) should be removed.
@@ -93,6 +94,9 @@ const STRIP_WITH_ARGS: &[(&str, usize)] = &[
     ("markright", 1),
     ("DeclareRobustCommand", 2),
     ("pagenumbering", 1),
+    // Index/glossary entries (should not leak into text)
+    ("index", 1),
+    ("glossary", 1),
 ];
 
 /// Strip commands that collide with diacritic patterns.
@@ -314,7 +318,7 @@ static MATH_KEEP: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         "exp", "min", "max", "sup", "inf", "arg", "det", "dim",
         "gcd", "hom", "ker", "deg", "Pr", "oint", "iint", "iiint",
         "bigcup", "bigcap", "bigoplus", "bigotimes", "coprod",
-        "mathbb", "mathscr", "mathcal", "mathrm", "mathbf",
+        "mathbb", "mathscr", "mathcal", "mathrm", "mathbf", "mathtt",
     ]
     .into_iter()
     .collect()
@@ -944,5 +948,20 @@ mod tests {
         let result = strip_pre_diacritic_commands(r"\tikzset{foo=bar} text");
         assert!(result.contains("text"));
         assert!(!result.contains("tikzset"));
+    }
+
+    #[test]
+    fn test_index_stripped() {
+        let result = strip_pre_diacritic_commands(r"text\index{keyword} more");
+        assert!(result.contains("text"));
+        assert!(result.contains("more"));
+        assert!(!result.contains("keyword"), "index should be stripped: {result}");
+    }
+
+    #[test]
+    fn test_makeindex_stripped() {
+        let result = strip_pre_diacritic_commands(r"\makeindex some text");
+        assert!(result.contains("some text"));
+        assert!(!result.contains("makeindex"));
     }
 }
