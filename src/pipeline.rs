@@ -12,9 +12,10 @@ use crate::preamble::extract_body;
 use crate::references::convert_references;
 use crate::structure::convert_structure;
 use crate::symbols::convert_symbols;
-use crate::timing::StageTimings;
+use crate::timing::{deadline_expired, StageTimings};
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// State threaded through the pipeline to share data between stages.
 pub struct PipelineContext {
@@ -35,11 +36,15 @@ pub struct ExtractionOutput {
 /// Returns the extracted text, or None if extraction produces empty output.
 /// This is the original API — timing data is discarded.
 pub fn extract_text(tex_files: &[TexFile]) -> Option<String> {
-    extract_text_timed(tex_files).text
+    extract_text_timed(tex_files, None).text
 }
 
 /// Run the full extraction pipeline, returning both text and per-stage timings.
-pub fn extract_text_timed(tex_files: &[TexFile]) -> ExtractionOutput {
+///
+/// When `deadline` is `Some`, the pipeline bails out between stages once the
+/// deadline has passed, returning `text: None`. The caller is responsible for
+/// checking elapsed time to distinguish a timeout from a genuinely empty document.
+pub fn extract_text_timed(tex_files: &[TexFile], deadline: Option<Instant>) -> ExtractionOutput {
     if tex_files.is_empty() {
         return ExtractionOutput {
             text: None,
@@ -66,7 +71,10 @@ pub fn extract_text_timed(tex_files: &[TexFile]) -> ExtractionOutput {
 
     let mut parts = Vec::new();
     for file in &ordered_files {
-        match clean_tex_file(&file.content, &mut ctx, &mut timings) {
+        if deadline_expired(deadline) {
+            return ExtractionOutput { text: None, timings };
+        }
+        match clean_tex_file(&file.content, &mut ctx, &mut timings, deadline) {
             Some(cleaned) if !cleaned.is_empty() => parts.push(cleaned),
             _ => {}
         }
@@ -97,7 +105,14 @@ fn clean_tex_file(
     file_content: &str,
     ctx: &mut PipelineContext,
     timings: &mut StageTimings,
+    deadline: Option<Instant>,
 ) -> Option<String> {
+    macro_rules! check_deadline {
+        () => {
+            if deadline_expired(deadline) { return None; }
+        };
+    }
+
     let (preamble_extras, body) = extract_body(file_content);
 
     let mut body = if preamble_extras.is_empty() {
@@ -107,26 +122,37 @@ fn clean_tex_file(
     };
 
     body = timings.time("remove_comments", || remove_comments(&body));
+    check_deadline!();
     body = timings.time("normalize_shorthands", || normalize_shorthands(&body));
-    body = timings.time("expand_macros", || expand_macros(&body, &ctx.macros));
+    check_deadline!();
+    body = timings.time("expand_macros", || expand_macros(&body, &ctx.macros, deadline));
+    check_deadline!();
     body = timings.time("expand_parametric", || {
-        expand_parametric_macros(&body, &ctx.parametric_macros)
+        expand_parametric_macros(&body, &ctx.parametric_macros, deadline)
     });
+    check_deadline!();
     body = timings.time("convert_structure", || {
         convert_structure(&body, &mut ctx.section_label_map)
     });
+    check_deadline!();
     body = timings.time("convert_references", || {
         convert_references(&body, &ctx.section_label_map)
     });
+    check_deadline!();
     body = timings.time("convert_formatting", || convert_formatting(&body));
+    check_deadline!();
     body = timings.time("convert_environments", || {
         convert_environments(&body, &ctx.custom_theorems)
     });
+    check_deadline!();
     body = timings.time("strip_pre_diacritic", || {
         strip_pre_diacritic_commands(&body)
     });
+    check_deadline!();
     body = timings.time("convert_diacritics", || convert_diacritics(&body));
+    check_deadline!();
     body = timings.time("convert_symbols", || convert_symbols(&body));
+    check_deadline!();
     body = timings.time("cleanup", || cleanup(&body));
 
     if body.trim().is_empty() {
@@ -308,7 +334,7 @@ Hello.
 \end{document}"
                 .into(),
         }];
-        let output = extract_text_timed(&files);
+        let output = extract_text_timed(&files, None);
         assert!(output.text.is_some());
         assert!(output.text.unwrap().contains("Hello."));
 

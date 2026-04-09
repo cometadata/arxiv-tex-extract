@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -825,79 +825,43 @@ fn extract_with_timeout(
         }
     }
 
-    // Clone data for the spawned thread (thread::spawn requires 'static)
-    let tex_files = paper.tex_files.clone();
-    let arxiv_id = paper.arxiv_id.clone();
-    let file_type = paper.file_type;
-    let entry_name = paper.entry_name.clone();
-    let source_tar_owned = source_tar.map(|s| s.to_string());
+    let deadline_at = Instant::now() + timeout;
+    let result = process_paper(paper, source_tar, Some(deadline_at));
 
-    let (tx, rx) = mpsc::channel();
-
-    thread::spawn(move || {
-        let paper = PaperArchive {
-            arxiv_id,
-            tex_files,
-            file_type,
-            entry_name,
-        };
-        let result = process_paper(&paper, source_tar_owned.as_deref());
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            error!(
-                category = "timeout",
-                arxiv_id = %paper.arxiv_id,
-                "timed out after {}s",
+    // The pipeline bails between stages when the deadline passes, but a
+    // slow final stage can push past it. This post-call check also
+    // distinguishes a genuinely empty document from a cooperative timeout.
+    if Instant::now() >= deadline_at {
+        error!(
+            category = "timeout",
+            arxiv_id = %paper.arxiv_id,
+            "timed out after {}s",
+            timeout.as_secs()
+        );
+        return ExtractionResult {
+            arxiv_id: paper.arxiv_id.clone(),
+            source_tar: source_tar.map(|s| s.to_string()),
+            status: "timeout".into(),
+            num_tex_files: Some(num_files),
+            text_length: None,
+            text: None,
+            error: Some(format!(
+                "extraction timed out after {}s",
                 timeout.as_secs()
-            );
-            ExtractionResult {
-                arxiv_id: paper.arxiv_id.clone(),
-                source_tar: source_tar.map(|s| s.to_string()),
-                status: "timeout".into(),
-                num_tex_files: Some(num_files),
-                text_length: None,
-                text: None,
-                error: Some(format!(
-                    "extraction timed out after {}s",
-                    timeout.as_secs()
-                )),
-                stage_timings_us: None,
-                total_time_us: None,
-                peak_memory_bytes: None,
-                file_type: Some(paper.file_type),
-                entry_name: Some(paper.entry_name.clone()),
-            }
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            error!(
-                category = "crash",
-                arxiv_id = %paper.arxiv_id,
-                "extraction thread crashed"
-            );
-            ExtractionResult {
-                arxiv_id: paper.arxiv_id.clone(),
-                source_tar: source_tar.map(|s| s.to_string()),
-                status: "error".into(),
-                num_tex_files: Some(num_files),
-                text_length: None,
-                text: None,
-                error: Some("extraction thread crashed".into()),
-                stage_timings_us: None,
-                total_time_us: None,
-                peak_memory_bytes: None,
-                file_type: Some(paper.file_type),
-                entry_name: Some(paper.entry_name.clone()),
-            }
-        }
+            )),
+            stage_timings_us: None,
+            total_time_us: None,
+            peak_memory_bytes: None,
+            file_type: Some(paper.file_type),
+            entry_name: Some(paper.entry_name.clone()),
+        };
     }
+
+    result
 }
 
 /// Process a single paper with panic isolation.
-fn process_paper(paper: &PaperArchive, source_tar: Option<&str>) -> ExtractionResult {
+fn process_paper(paper: &PaperArchive, source_tar: Option<&str>, deadline: Option<Instant>) -> ExtractionResult {
     if paper.tex_files.is_empty() {
         return ExtractionResult {
             arxiv_id: paper.arxiv_id.clone(),
@@ -915,11 +879,10 @@ fn process_paper(paper: &PaperArchive, source_tar: Option<&str>) -> ExtractionRe
         };
     }
 
-    let tex_files = paper.tex_files.clone();
-    let num_files = tex_files.len();
+    let num_files = paper.tex_files.len();
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        extract_text_timed(&tex_files)
+        extract_text_timed(&paper.tex_files, deadline)
     }));
 
     match result {
@@ -1040,11 +1003,6 @@ mod tests {
 
     #[test]
     fn test_timeout_fires() {
-        // Create a paper with content that will process quickly, but
-        // simulate a timeout by using a very short timeout duration
-        // with content that takes longer than that.
-        // We use a 0-second timeout to guarantee the timeout fires
-        // before the spawned thread completes.
         let paper = PaperArchive {
             arxiv_id: "test.timeout".into(),
             tex_files: vec![TexFile {
@@ -1054,10 +1012,9 @@ mod tests {
             file_type: FileType::Tex,
             entry_name: "test.gz".into(),
         };
-        // Duration::ZERO means recv_timeout returns immediately
+        // Duration::ZERO means the deadline is already expired when the
+        // post-call check runs, so this should report as timeout.
         let result = extract_with_timeout(&paper, None, Duration::ZERO, DEFAULT_MAX_TEX_BYTES, None);
-        // With zero timeout, we get either timeout or the result (race),
-        // but the mechanism is exercised either way.
         assert!(result.status == "timeout" || result.status == "ok");
     }
 

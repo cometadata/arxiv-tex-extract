@@ -1,8 +1,10 @@
 use crate::braces::{extract_command_arg, extract_optional_arg, find_braced_group};
 use crate::symbols::CommandReplacer;
+use crate::timing::deadline_expired;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
+use std::time::Instant;
 
 static PROTECTED_MACROS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
@@ -310,7 +312,7 @@ const LARGE_INPUT_THRESHOLD: usize = 5_000_000;
 /// Iterates up to `max_passes` times to resolve multi-level macro chains
 /// (e.g. \foo -> \bar -> "final"). For inputs above 5MB, the cap is reduced
 /// from 5 to 3 passes to limit worst-case scanning.
-pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
+pub fn expand_macros(text: &str, macros: &HashMap<String, String>, deadline: Option<Instant>) -> String {
     if macros.is_empty() {
         return text.to_string();
     }
@@ -322,6 +324,7 @@ pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
 
     let mut result = text.to_string();
     for _ in 0..max_passes {
+        if deadline_expired(deadline) { break; }
         let next = replacer.replace_all(&result);
         if next == result {
             break;
@@ -334,7 +337,7 @@ pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
 /// Expand parametric macros by substituting `#1`, `#2`, etc. with extracted arguments.
 ///
 /// Iterates up to 3 passes (2 for large inputs) to resolve nested parametric macros.
-pub fn expand_parametric_macros(text: &str, macros: &[ParametricMacro]) -> String {
+pub fn expand_parametric_macros(text: &str, macros: &[ParametricMacro], deadline: Option<Instant>) -> String {
     if macros.is_empty() {
         return text.to_string();
     }
@@ -343,6 +346,7 @@ pub fn expand_parametric_macros(text: &str, macros: &[ParametricMacro]) -> Strin
     let mut result = text.to_string();
 
     for _ in 0..max_passes {
+        if deadline_expired(deadline) { break; }
         let prev = result.clone();
         for mac in macros {
             result = expand_single_parametric(&result, mac);
@@ -524,7 +528,7 @@ mod tests {
     fn test_expand_macros() {
         let mut macros = HashMap::new();
         macros.insert("\\foo".to_string(), "bar".to_string());
-        assert_eq!(expand_macros("\\foo is good", &macros), "bar is good");
+        assert_eq!(expand_macros("\\foo is good", &macros, None), "bar is good");
     }
 
     #[test]
@@ -532,14 +536,14 @@ mod tests {
         let mut macros = HashMap::new();
         macros.insert("\\foo".to_string(), "bar".to_string());
         // \foobar should NOT be expanded
-        assert_eq!(expand_macros("\\foobar", &macros), "\\foobar");
+        assert_eq!(expand_macros("\\foobar", &macros, None), "\\foobar");
     }
 
     #[test]
     fn test_expand_macros_at_eof() {
         let mut macros = HashMap::new();
         macros.insert("\\foo".to_string(), "bar".to_string());
-        assert_eq!(expand_macros("\\foo", &macros), "bar");
+        assert_eq!(expand_macros("\\foo", &macros, None), "bar");
     }
 
     #[test]
@@ -547,7 +551,7 @@ mod tests {
         let mut macros = HashMap::new();
         macros.insert("\\foo".to_string(), "\\bar".to_string());
         macros.insert("\\bar".to_string(), "final".to_string());
-        assert_eq!(expand_macros("\\foo", &macros), "final");
+        assert_eq!(expand_macros("\\foo", &macros, None), "final");
     }
 
     #[test]
@@ -556,7 +560,7 @@ mod tests {
         macros.insert("\\aaa".to_string(), "\\bbb".to_string());
         macros.insert("\\bbb".to_string(), "\\ccc".to_string());
         macros.insert("\\ccc".to_string(), "done".to_string());
-        assert_eq!(expand_macros("\\aaa", &macros), "done");
+        assert_eq!(expand_macros("\\aaa", &macros, None), "done");
     }
 
     #[test]
@@ -570,7 +574,7 @@ mod tests {
         let mut large_input = "x".repeat(LARGE_INPUT_THRESHOLD + 1);
         large_input.push_str("\\aaa");
 
-        let result = expand_macros(&large_input, &macros);
+        let result = expand_macros(&large_input, &macros, None);
         assert!(
             result.ends_with("done"),
             "3-level chain should resolve with 3 passes on large input"
@@ -670,7 +674,7 @@ mod tests {
             body: "\\mathbf{#1}".into(),
             optional_default: None,
         }];
-        let result = expand_parametric_macros("\\vect{x}", &macros);
+        let result = expand_parametric_macros("\\vect{x}", &macros, None);
         assert_eq!(result, "\\mathbf{x}");
     }
 
@@ -682,7 +686,7 @@ mod tests {
             body: "#1 + #2".into(),
             optional_default: None,
         }];
-        let result = expand_parametric_macros("\\foo{a}{b}", &macros);
+        let result = expand_parametric_macros("\\foo{a}{b}", &macros, None);
         assert_eq!(result, "a + b");
     }
 
@@ -696,12 +700,12 @@ mod tests {
         }];
         // Without optional arg: uses default
         assert_eq!(
-            expand_parametric_macros("\\greet{World}", &macros),
+            expand_parametric_macros("\\greet{World}", &macros, None),
             "Hello, World!"
         );
         // With explicit optional arg
         assert_eq!(
-            expand_parametric_macros("\\greet[Hi]{World}", &macros),
+            expand_parametric_macros("\\greet[Hi]{World}", &macros, None),
             "Hi, World!"
         );
     }
@@ -716,7 +720,7 @@ mod tests {
         }];
         // \foobar should NOT match \foo
         assert_eq!(
-            expand_parametric_macros("\\foobar{x}", &macros),
+            expand_parametric_macros("\\foobar{x}", &macros, None),
             "\\foobar{x}"
         );
     }
@@ -731,7 +735,7 @@ mod tests {
         }];
         // \foo without braced arg should be left as-is
         assert_eq!(
-            expand_parametric_macros("\\foo is here", &macros),
+            expand_parametric_macros("\\foo is here", &macros, None),
             "\\foo is here"
         );
     }
@@ -745,7 +749,7 @@ mod tests {
             optional_default: None,
         }];
         assert_eq!(
-            expand_parametric_macros("\\wrap{a {b} c}", &macros),
+            expand_parametric_macros("\\wrap{a {b} c}", &macros, None),
             "[a {b} c]"
         );
     }
@@ -759,7 +763,7 @@ mod tests {
             optional_default: None,
         }];
         assert_eq!(
-            expand_parametric_macros("\\b{x} and \\b{y}", &macros),
+            expand_parametric_macros("\\b{x} and \\b{y}", &macros, None),
             "**x** and **y**"
         );
     }
@@ -781,7 +785,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            expand_parametric_macros("\\inner{\\vect{x}}{\\vect{y}}", &macros),
+            expand_parametric_macros("\\inner{\\vect{x}}{\\vect{y}}", &macros, None),
             "\\langle \\mathbf{x}, \\mathbf{y} \\rangle"
         );
     }
@@ -795,7 +799,7 @@ mod tests {
             optional_default: None,
         }];
         assert_eq!(
-            expand_parametric_macros("\\foo{test}", &macros),
+            expand_parametric_macros("\\foo{test}", &macros, None),
             "test has a # sign"
         );
     }

@@ -1,5 +1,11 @@
 use std::time::Instant;
 
+/// Returns true if the deadline has passed.
+#[inline]
+pub fn deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|d| Instant::now() >= d)
+}
+
 /// Collects wall-clock timing for each pipeline stage.
 #[derive(Debug, Clone, Default)]
 pub struct StageTimings {
