@@ -59,9 +59,11 @@ pub struct ExtractionResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_memory_bytes: Option<u64>,
 
+    /// Source file type detected from archive content (tex, pdf, postscript, html, unknown).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_type: Option<FileType>,
 
+    /// Original tar entry path or file path for this paper.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_name: Option<String>,
 }

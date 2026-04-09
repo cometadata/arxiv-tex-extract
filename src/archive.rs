@@ -16,14 +16,18 @@ const MAX_DECOMPRESSED_SIZE: u64 = 100_000_000;
 
 /// Detect file type from the first bytes of decompressed content.
 fn detect_file_type(bytes: &[u8]) -> FileType {
+    if bytes.is_empty() {
+        return FileType::Unknown;
+    }
     if bytes.starts_with(b"%PDF") {
         FileType::Pdf
     } else if bytes.starts_with(b"%!PS") {
         FileType::Postscript
     } else {
+        // 15 bytes accommodates "<!doctype html>" (longest prefix we check).
         let prefix = &bytes[..bytes.len().min(15)];
-        if prefix.len() >= 5 && prefix[..5].eq_ignore_ascii_case(b"<html")
-            || prefix.len() >= 9 && prefix[..9].eq_ignore_ascii_case(b"<!doctype")
+        if (prefix.len() >= 5 && prefix[..5].eq_ignore_ascii_case(b"<html"))
+            || (prefix.len() >= 9 && prefix[..9].eq_ignore_ascii_case(b"<!doctype"))
         {
             FileType::Html
         } else {
@@ -347,5 +351,40 @@ mod tests {
         let mut bytes = vec![0xEF, 0xBB, 0xBF]; // BOM
         bytes.extend_from_slice("hello".as_bytes());
         assert_eq!(decode_bytes(&bytes).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_detect_file_type_empty() {
+        assert_eq!(detect_file_type(b""), FileType::Unknown);
+    }
+
+    #[test]
+    fn test_detect_file_type_pdf() {
+        assert_eq!(detect_file_type(b"%PDF-1.4 fake pdf"), FileType::Pdf);
+    }
+
+    #[test]
+    fn test_detect_file_type_postscript() {
+        assert_eq!(detect_file_type(b"%!PS-Adobe-3.0"), FileType::Postscript);
+    }
+
+    #[test]
+    fn test_detect_file_type_html_doctype() {
+        assert_eq!(detect_file_type(b"<!DOCTYPE html>"), FileType::Html);
+        assert_eq!(detect_file_type(b"<!doctype html>"), FileType::Html);
+    }
+
+    #[test]
+    fn test_detect_file_type_html_tag() {
+        assert_eq!(detect_file_type(b"<html>"), FileType::Html);
+        assert_eq!(detect_file_type(b"<HTML>"), FileType::Html);
+    }
+
+    #[test]
+    fn test_detect_file_type_tex() {
+        assert_eq!(
+            detect_file_type(b"\\documentclass{article}"),
+            FileType::Tex
+        );
     }
 }
