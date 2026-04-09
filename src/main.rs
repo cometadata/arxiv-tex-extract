@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::panic;
@@ -85,6 +86,10 @@ struct Args {
     /// Emit _metrics.json sidecar files per shard
     #[arg(long)]
     metrics: bool,
+
+    /// Maximum outer tars to load into memory at once (controls memory vs parallelism)
+    #[arg(long, default_value_t = 4)]
+    concurrent_tars: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -162,7 +167,7 @@ fn main() -> Result<()> {
                 .output_dir
                 .as_ref()
                 .context("--output-dir is required when --input-file is a directory")?;
-            process_batch(input_file, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics)?;
+            process_batch(input_file, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics, args.concurrent_tars)?;
         } else {
             process_single_file(input_file, timeout, max_tex_bytes, max_memory_bytes, text_files)?;
         }
@@ -171,7 +176,7 @@ fn main() -> Result<()> {
             .output_dir
             .as_ref()
             .context("--output-dir is required in batch mode")?;
-        process_batch(input_dir, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics)?;
+        process_batch(input_dir, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics, args.concurrent_tars)?;
     } else {
         anyhow::bail!("Either --input-dir or --input-file must be specified");
     }
@@ -213,6 +218,7 @@ fn process_batch(
     max_shard_bytes: usize,
     resume: bool,
     emit_metrics: bool,
+    concurrent_tars: usize,
 ) -> Result<()> {
     fs::create_dir_all(output_dir)?;
 
@@ -247,9 +253,9 @@ fn process_batch(
             .filter(|p| p.extension().map_or(false, |e| e == "tar"))
             .collect();
         if text_files {
-            process_outer_tars_text(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes)?;
+            process_outer_tars_text(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, concurrent_tars)?;
         } else {
-            process_outer_tars(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, resume, emit_metrics)?;
+            process_outer_tars(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, resume, emit_metrics, concurrent_tars)?;
         }
     } else if text_files {
         process_individual_archives_text(&archive_files, output_dir, timeout, max_tex_bytes, max_memory_bytes)?;
@@ -260,7 +266,11 @@ fn process_batch(
     Ok(())
 }
 
-/// Process outer tar files in parallel.
+/// Process outer tar files with per-paper parallelism.
+///
+/// Papers from multiple tars are collected in chunks and processed in
+/// parallel across all rayon threads, eliminating the tail effect that
+/// occurs when parallelism is at the tar level.
 fn process_outer_tars(
     tar_files: &[PathBuf],
     output_dir: &Path,
@@ -272,6 +282,7 @@ fn process_outer_tars(
     max_shard_bytes: usize,
     resume: bool,
     emit_metrics: bool,
+    concurrent_tars: usize,
 ) -> Result<()> {
     let checkpoint_path = output_dir.join("checkpoint.log");
 
@@ -304,7 +315,7 @@ fn process_outer_tars(
         return Ok(());
     }
 
-    let counts = Arc::new(Mutex::new(StatusCounts::default()));
+    let mut global_counts = StatusCounts::default();
 
     let progress = ProgressBar::new(pending.len() as u64);
     progress.set_style(
@@ -313,35 +324,172 @@ fn process_outer_tars(
             .unwrap(),
     );
 
-    let cp_path = checkpoint_path.clone();
+    for chunk in pending.chunks(concurrent_tars) {
+        let chunk_start = std::time::Instant::now();
 
-    pending.par_iter().for_each(|tar_path| {
-        match process_outer_tar(tar_path, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, emit_metrics) {
-            Ok(tar_counts) => {
-                counts.lock().unwrap().merge(&tar_counts);
+        let mut all_papers: Vec<(String, String, PaperArchive)> = Vec::new();
+        let mut archive_counts = StatusCounts::default();
+        let mut chunk_tar_info: Vec<(String, String)> = Vec::new();
 
-                let tar_name = tar_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                if let Err(e) = checkpoint::record_checkpoint(&cp_path, &tar_name) {
-                    error!("Checkpoint write error: {}", e);
+        for tar_path in chunk {
+            let stem = tar_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let source_tar = tar_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            chunk_tar_info.push((stem.clone(), source_tar.clone()));
+
+            match File::open(tar_path) {
+                Ok(file) => {
+                    for paper_result in archive::iter_papers(file) {
+                        match paper_result {
+                            Ok(paper) => {
+                                all_papers.push((stem.clone(), source_tar.clone(), paper));
+                            }
+                            Err(e) => {
+                                error!(category = "archive", tar = %stem, "entry error: {}", e);
+                                archive_counts.record(Outcome::ArchiveError, "unknown");
+                            }
+                        }
+                    }
                 }
-            }
-            Err(e) => {
-                error!("Failed to process {}: {}", tar_path.display(), e);
-                let tar_name = tar_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                counts.lock().unwrap().record(Outcome::ArchiveError, &tar_name);
+                Err(e) => {
+                    error!("Failed to open {}: {}", tar_path.display(), e);
+                    archive_counts.record(Outcome::ArchiveError, &stem);
+                }
             }
         }
 
-        progress.inc(1);
-    });
+        let output_dir_owned = output_dir.to_path_buf();
+        let chunk_tar_info_w = chunk_tar_info.clone();
+
+        let (tx, rx) = mpsc::channel::<(String, ExtractionResult)>();
+
+        let writer_handle = thread::spawn(move || -> Result<()> {
+            match format {
+                OutputFormat::Parquet => {
+                    let mut writers: HashMap<String, ParquetShardWriter> = chunk_tar_info_w
+                        .iter()
+                        .map(|(stem, _)| {
+                            (
+                                stem.clone(),
+                                ParquetShardWriter::new(
+                                    &output_dir_owned,
+                                    stem,
+                                    max_shard_rows,
+                                    max_shard_bytes,
+                                ),
+                            )
+                        })
+                        .collect();
+
+                    for (stem, result) in rx {
+                        if let Some(writer) = writers.get_mut(&stem) {
+                            if let Err(e) = writer.write(result) {
+                                error!(category = "io", tar = %stem, "parquet write error: {}", e);
+                            }
+                        }
+                    }
+
+                    for (stem, writer) in writers {
+                        if let Err(e) = writer.finish() {
+                            error!(category = "io", tar = %stem, "parquet finish error: {}", e);
+                        }
+                    }
+                }
+                OutputFormat::Jsonl => {
+                    let mut writers: HashMap<String, BufWriter<File>> = HashMap::new();
+                    let mut paths: HashMap<String, (PathBuf, PathBuf)> = HashMap::new();
+
+                    for (stem, _) in &chunk_tar_info_w {
+                        let final_path = output_dir_owned.join(format!("{}.jsonl", stem));
+                        let temp_path = output_dir_owned.join(format!(".{}.jsonl.tmp", stem));
+                        let file = File::create(&temp_path)?;
+                        writers.insert(stem.clone(), BufWriter::new(file));
+                        paths.insert(stem.clone(), (temp_path, final_path));
+                    }
+
+                    for (stem, result) in rx {
+                        if let Some(writer) = writers.get_mut(&stem) {
+                            if let Err(e) = serde_json::to_writer(&mut *writer, &result) {
+                                error!(category = "io", tar = %stem, "JSON write error: {}", e);
+                            } else {
+                                let _ = writer.write_all(b"\n");
+                            }
+                        }
+                    }
+
+                    for (stem, mut writer) in writers {
+                        let _ = writer.flush();
+                        drop(writer);
+                        if let Some((temp_path, final_path)) = paths.remove(&stem) {
+                            fs::rename(&temp_path, &final_path)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+
+        let per_tar_counts = Mutex::new(HashMap::<String, StatusCounts>::new());
+
+        all_papers
+            .into_par_iter()
+            .for_each_with(tx, |tx, (stem, source_tar, paper)| {
+                let result = extract_with_timeout(
+                    &paper,
+                    Some(&source_tar),
+                    timeout,
+                    max_tex_bytes,
+                    max_memory_bytes,
+                );
+                per_tar_counts
+                    .lock()
+                    .unwrap()
+                    .entry(stem.clone())
+                    .or_default()
+                    .record(classify_result(&result), &result.arxiv_id);
+                let _ = tx.send((stem, result));
+            });
+
+        writer_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
+
+        let per_tar_counts = per_tar_counts.into_inner().unwrap();
+        let mut chunk_counts = archive_counts;
+
+        for (stem, source_tar) in &chunk_tar_info {
+            if let Some(tar_counts) = per_tar_counts.get(stem) {
+                chunk_counts.merge(tar_counts);
+            }
+
+            if let Err(e) = checkpoint::record_checkpoint(&checkpoint_path, source_tar) {
+                error!("Checkpoint write error: {}", e);
+            }
+
+            if emit_metrics {
+                let elapsed = chunk_start.elapsed();
+                let tar_counts = per_tar_counts.get(stem).cloned().unwrap_or_default();
+                let m = TarMetrics::from_counts(
+                    source_tar.clone(),
+                    &tar_counts,
+                    elapsed.as_millis() as u64,
+                );
+                if let Err(e) = metrics::write_metrics(output_dir, stem, &m) {
+                    error!("Metrics write error for {}: {}", stem, e);
+                }
+            }
+
+            progress.inc(1);
+        }
+
+        global_counts.merge(&chunk_counts);
+    }
 
     progress.finish();
 
-    let c = counts.lock().unwrap();
-    c.log_summary(&format!(
+    global_counts.log_summary(&format!(
         "Done: {} tars, {} papers",
         tar_files.len(),
-        c.total()
+        global_counts.total()
     ));
 
     Ok(())
@@ -546,12 +694,13 @@ fn process_outer_tars_text(
     timeout: Duration,
     max_tex_bytes: usize,
     max_memory_bytes: Option<usize>,
+    concurrent_tars: usize,
 ) -> Result<()> {
     let pending: Vec<&PathBuf> = tar_files.iter().collect();
 
     info!("{} outer tars to process", pending.len());
 
-    let counts = Arc::new(Mutex::new(StatusCounts::default()));
+    let mut global_counts = StatusCounts::default();
 
     let progress = ProgressBar::new(pending.len() as u64);
     progress.set_style(
@@ -562,173 +711,87 @@ fn process_outer_tars_text(
 
     let output_dir_owned = output_dir.to_path_buf();
 
-    pending.par_iter().for_each(|tar_path| {
-        match process_outer_tar_text(tar_path, &output_dir_owned, timeout, max_tex_bytes, max_memory_bytes) {
-            Ok(tar_counts) => {
-                counts.lock().unwrap().merge(&tar_counts);
-            }
-            Err(e) => {
-                error!("Failed to process {}: {}", tar_path.display(), e);
-                let tar_name = tar_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                counts.lock().unwrap().record(Outcome::ArchiveError, &tar_name);
+    for chunk in pending.chunks(concurrent_tars) {
+        let mut all_papers: Vec<(String, PaperArchive)> = Vec::new();
+        let mut archive_counts = StatusCounts::default();
+
+        for tar_path in chunk {
+            let source_tar = tar_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let stem = tar_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            match File::open(tar_path) {
+                Ok(file) => {
+                    for paper_result in archive::iter_papers(file) {
+                        match paper_result {
+                            Ok(paper) => all_papers.push((source_tar.clone(), paper)),
+                            Err(e) => {
+                                error!(category = "archive", tar = %stem, "entry error: {}", e);
+                                archive_counts.record(Outcome::ArchiveError, "unknown");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to process {}: {}", tar_path.display(), e);
+                    archive_counts.record(Outcome::ArchiveError, &stem);
+                }
             }
         }
 
-        progress.inc(1);
-    });
+        let chunk_counts = Mutex::new(StatusCounts::default());
+
+        all_papers.into_par_iter().for_each(|(source_tar, paper)| {
+            let result = extract_with_timeout(
+                &paper,
+                Some(&source_tar),
+                timeout,
+                max_tex_bytes,
+                max_memory_bytes,
+            );
+            let outcome = classify_result(&result);
+            if let Some(text) = &result.text {
+                let out_path =
+                    output_dir_owned.join(format!("{}.txt", sanitize_id(&result.arxiv_id)));
+                if let Err(e) = fs::write(&out_path, text) {
+                    error!(category = "io", arxiv_id = %result.arxiv_id, "text file write error: {}", e);
+                    chunk_counts
+                        .lock()
+                        .unwrap()
+                        .record(Outcome::IoError, &result.arxiv_id);
+                }
+            }
+            chunk_counts
+                .lock()
+                .unwrap()
+                .record(outcome, &result.arxiv_id);
+        });
+
+        let mut chunk_counts = chunk_counts.into_inner().unwrap();
+        chunk_counts.merge(&archive_counts);
+        global_counts.merge(&chunk_counts);
+
+        for _ in chunk {
+            progress.inc(1);
+        }
+    }
 
     progress.finish();
 
-    let c = counts.lock().unwrap();
-    c.log_summary(&format!(
+    global_counts.log_summary(&format!(
         "Done: {} tars, {} papers",
         tar_files.len(),
-        c.total()
+        global_counts.total()
     ));
 
     Ok(())
-}
-
-/// Process a single outer tar file, writing .txt files per paper.
-fn process_outer_tar_text(
-    tar_path: &Path,
-    output_dir: &Path,
-    timeout: Duration,
-    max_tex_bytes: usize,
-    max_memory_bytes: Option<usize>,
-) -> Result<StatusCounts> {
-    let source_tar = tar_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let stem = tar_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    let file = File::open(tar_path)?;
-    let mut counts = StatusCounts::default();
-
-    archive::for_each_paper(file, |paper_result| {
-        match paper_result {
-            Ok(paper) => {
-                let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
-                let outcome = classify_result(&result);
-                if let Some(text) = &result.text {
-                    let out_path =
-                        output_dir.join(format!("{}.txt", sanitize_id(&result.arxiv_id)));
-                    if let Err(e) = fs::write(&out_path, text) {
-                        error!(category = "io", arxiv_id = %result.arxiv_id, "text file write error: {}", e);
-                        counts.record(Outcome::IoError, &result.arxiv_id);
-                    }
-                }
-                counts.record(outcome, &result.arxiv_id);
-            }
-            Err(e) => {
-                error!(category = "archive", tar = %stem, "entry error: {}", e);
-                counts.record(Outcome::ArchiveError, "unknown");
-            }
-        }
-    });
-
-    Ok(counts)
-}
-
-/// Process a single outer tar file.
-fn process_outer_tar(
-    tar_path: &Path,
-    output_dir: &Path,
-    timeout: Duration,
-    max_tex_bytes: usize,
-    max_memory_bytes: Option<usize>,
-    format: OutputFormat,
-    max_shard_rows: usize,
-    max_shard_bytes: usize,
-    emit_metrics: bool,
-) -> Result<StatusCounts> {
-    let stem = tar_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let source_tar = tar_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    let start = std::time::Instant::now();
-    let file = File::open(tar_path)?;
-
-    let mut counts = StatusCounts::default();
-
-    match format {
-        OutputFormat::Parquet => {
-            let mut writer =
-                ParquetShardWriter::new(output_dir, &stem, max_shard_rows, max_shard_bytes);
-
-            archive::for_each_paper(file, |paper_result| {
-                match paper_result {
-                    Ok(paper) => {
-                        let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
-                        counts.record(classify_result(&result), &result.arxiv_id);
-                        if let Err(e) = writer.write(result) {
-                            error!(category = "io", tar = %stem, "parquet write error: {}", e);
-                            counts.record(Outcome::IoError, &paper.arxiv_id);
-                        }
-                    }
-                    Err(e) => {
-                        error!(category = "archive", tar = %stem, "entry error: {}", e);
-                        counts.record(Outcome::ArchiveError, "unknown");
-                    }
-                }
-            });
-
-            if let Err(e) = writer.finish() {
-                error!(category = "io", tar = %stem, "parquet finish error: {}", e);
-            }
-        }
-        OutputFormat::Jsonl => {
-            let output_path = output_dir.join(format!("{}.jsonl", stem));
-            let temp_path = output_dir.join(format!(".{}.jsonl.tmp", stem));
-            let output_file = File::create(&temp_path)?;
-            let mut writer = BufWriter::new(output_file);
-
-            archive::for_each_paper(file, |paper_result| {
-                match paper_result {
-                    Ok(paper) => {
-                        let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
-                        counts.record(classify_result(&result), &result.arxiv_id);
-                        if let Err(e) = serde_json::to_writer(&mut writer, &result) {
-                            error!(category = "io", tar = %stem, "JSON write error: {}", e);
-                            counts.record(Outcome::IoError, &paper.arxiv_id);
-                        }
-                        let _ = writer.write_all(b"\n");
-                    }
-                    Err(e) => {
-                        error!(category = "archive", tar = %stem, "entry error: {}", e);
-                        counts.record(Outcome::ArchiveError, "unknown");
-                    }
-                }
-            });
-
-            writer.flush()?;
-            drop(writer);
-            fs::rename(&temp_path, &output_path)?;
-        }
-    }
-
-    if emit_metrics {
-        let elapsed = start.elapsed();
-        let m = TarMetrics::from_counts(source_tar, &counts, elapsed.as_millis() as u64);
-        if let Err(e) = metrics::write_metrics(output_dir, &stem, &m) {
-            error!("Metrics write error for {}: {}", stem, e);
-        }
-    }
-
-    Ok(counts)
 }
 
 /// Classify an ExtractionResult into an Outcome.
