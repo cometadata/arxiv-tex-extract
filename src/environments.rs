@@ -79,6 +79,9 @@ const LAYOUT_ENVS: &[&str] = &[
 /// Verbatim / code environments (remove markers, keep content)
 const VERBATIM_ENVS: &[&str] = &["verbatim", "Verbatim", "lstlisting", "minted", "alltt"];
 
+/// Environments to discard entirely (content and markers)
+const DISCARD_ENVS: &[&str] = &["filecontents", "filecontents*"];
+
 /// Convert LaTeX environments to readable form.
 /// `custom_theorems` maps env names (e.g. "dfn") to display names (e.g. "Definition").
 pub fn convert_environments(text: &str, custom_theorems: &HashMap<String, String>) -> String {
@@ -145,8 +148,37 @@ pub fn convert_environments(text: &str, custom_theorems: &HashMap<String, String
 
     result = convert_bibliography_env(&result);
 
+    for env in DISCARD_ENVS {
+        result = discard_env(&result, env);
+    }
+
     result = remove_remaining_envs(&result);
 
+    result
+}
+
+/// Discard an entire environment (markers + content → nothing).
+fn discard_env(text: &str, env_name: &str) -> String {
+    let begin_pat = format!("\\begin{{{}}}", env_name);
+    let end_pat = format!("\\end{{{}}}", env_name);
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    let mut search = 0;
+
+    while let Some(bp) = text[search..].find(&begin_pat) {
+        let abs_begin = search + bp;
+        if let Some(ep) = text[abs_begin..].find(&end_pat) {
+            let abs_end = abs_begin + ep + end_pat.len();
+            result.push_str(&text[last_end..abs_begin]);
+            last_end = abs_end;
+            search = abs_end;
+        } else {
+            break;
+        }
+    }
+
+    result.push_str(&text[last_end..]);
     result
 }
 
@@ -374,9 +406,43 @@ fn convert_theorem_env(text: &str, env_name: &str) -> String {
         result = new_result;
     }
 
-    result = result.replace(&end_pat, "\n");
-    result = result.replace(&end_pat_star, "\n");
+    // For proof environments, append □ (QED symbol) if not already present
+    if env_name == "proof" {
+        result = append_qed_to_proof(&result, &end_pat);
+        result = append_qed_to_proof(&result, &end_pat_star);
+    } else {
+        result = result.replace(&end_pat, "\n");
+        result = result.replace(&end_pat_star, "\n");
+    }
 
+    result
+}
+
+/// Replace \end{proof} with " □\n" if the preceding body doesn't contain \qed or \qedsymbol.
+fn append_qed_to_proof(text: &str, end_pat: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    let mut search = 0;
+
+    while let Some(pos) = text[search..].find(end_pat) {
+        let abs_pos = search + pos;
+        let after = abs_pos + end_pat.len();
+
+        // Check if the text between last_end and abs_pos contains \qed
+        let body = &text[last_end..abs_pos];
+        let has_qed = body.contains("\\qed") || body.contains("\\qedsymbol");
+
+        result.push_str(&text[last_end..abs_pos]);
+        if !has_qed {
+            result.push_str(" \u{25A1}");
+        }
+        result.push('\n');
+
+        last_end = after;
+        search = after;
+    }
+
+    result.push_str(&text[last_end..]);
     result
 }
 
@@ -900,5 +966,50 @@ mod tests {
         let input = r"\begin{cor}A corollary.\end{cor}";
         let result = convert_environments(input, &custom);
         assert!(result.contains("**Corollary.**"), "custom theorem: {result}");
+    }
+
+    // --- Stage 5a: proof QED ---
+
+    #[test]
+    fn test_proof_qed_appended() {
+        let input = r"\begin{proof}This is a proof.\end{proof}";
+        let result = ce(input);
+        assert!(result.contains("**Proof.**"), "proof label: {result}");
+        assert!(result.contains("\u{25A1}"), "QED symbol: {result}");
+    }
+
+    #[test]
+    fn test_proof_qed_not_duplicated() {
+        let input = r"\begin{proof}This has \qed already.\end{proof}";
+        let result = ce(input);
+        assert!(result.contains("**Proof.**"), "proof label: {result}");
+        assert!(!result.contains("\u{25A1}"), "should not add QED when \\qed present: {result}");
+    }
+
+    #[test]
+    fn test_proof_qedsymbol_not_duplicated() {
+        let input = r"\begin{proof}Has \qedsymbol here.\end{proof}";
+        let result = ce(input);
+        assert!(!result.contains("\u{25A1}"), "should not add QED when \\qedsymbol present: {result}");
+    }
+
+    // --- Stage 5b: discard environments ---
+
+    #[test]
+    fn test_filecontents_discarded() {
+        let input = "before\n\\begin{filecontents}{file.sty}\nsome content\n\\end{filecontents}\nafter";
+        let result = ce(input);
+        assert!(result.contains("before"));
+        assert!(result.contains("after"));
+        assert!(!result.contains("some content"));
+    }
+
+    #[test]
+    fn test_filecontents_star_discarded() {
+        let input = "before\n\\begin{filecontents*}{f.tex}\nstuff\n\\end{filecontents*}\nafter";
+        let result = ce(input);
+        assert!(result.contains("before"));
+        assert!(result.contains("after"));
+        assert!(!result.contains("stuff"));
     }
 }

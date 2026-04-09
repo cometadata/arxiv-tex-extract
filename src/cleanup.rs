@@ -4,6 +4,11 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+/// Regex to strip `\left`, `\right`, and `\big` sizing decorators from delimiters.
+static LEFT_RIGHT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\\(?:left|right|[Bb]ig{1,2}[lr])\s*(\\[{}|]|[()\[\]|.])").unwrap()
+});
+
 /// Spacing commands to replace with a space (handled in cleanup).
 const SPACING_COMMANDS: &[&str] = &[
     "quad", "qquad", "hfill", "vfill", "hspace", "vspace",
@@ -74,6 +79,11 @@ const STRIP_WITH_ARGS: &[(&str, usize)] = &[
     ("renewenvironment", 3),
     ("addcontentsline", 3),
     ("xymatrix", 1),
+    ("geometry", 1),
+    ("usetikzlibrary", 1),
+    ("tikzset", 1),
+    ("pgfplotsset", 1),
+    ("addvspace", 1),
     // Configuration commands whose args should not leak as text
     ("hypersetup", 1),
     ("definecolor", 3),
@@ -92,6 +102,7 @@ const STRIP_WITH_ARGS: &[(&str, usize)] = &[
 pub fn strip_pre_diacritic_commands(text: &str) -> String {
     let mut result = text.to_string();
 
+    result = strip_left_right_delimiters(&result);
     result = SPACING_DIM_RE.replace_all(&result, " ").to_string();
     result = LENGTH_ASSIGN_RE.replace_all(&result, " ").to_string();
 
@@ -108,6 +119,22 @@ pub fn strip_pre_diacritic_commands(text: &str) -> String {
     }
 
     result
+}
+
+/// Strip `\left`, `\right`, and `\big*` sizing decorators, leaving the delimiter.
+/// `\left(` → `(`, `\left\{` → `{`, `\left.` → nothing (invisible delimiter).
+fn strip_left_right_delimiters(text: &str) -> String {
+    LEFT_RIGHT_RE
+        .replace_all(text, |caps: &regex::Captures| {
+            match caps.get(1).unwrap().as_str() {
+                "\\{" => "{".to_string(),
+                "\\}" => "}".to_string(),
+                "\\|" => "\u{2016}".to_string(),
+                "." => String::new(),
+                other => other.to_string(),
+            }
+        })
+        .to_string()
 }
 
 /// Remove `\cmd{arg1}{arg2}...` consuming exactly `n_args` braced groups.
@@ -158,7 +185,7 @@ fn strip_command_with_args(text: &str, cmd_name: &str, n_args: usize) -> String 
 /// Identify byte ranges of math regions: `$...$`, `$$...$$`, `\(...\)`, `\[...\]`,
 /// and named math environments like `\begin{equation}...\end{equation}`.
 /// Returns a sorted, non-overlapping `Vec<(start, end)>` (end is exclusive).
-fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
+pub(crate) fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut regions = Vec::new();
     let mut i = 0;
@@ -265,7 +292,7 @@ fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
 }
 
 /// Check if byte position `pos` falls inside any math region (binary search).
-fn in_math(pos: usize, regions: &[(usize, usize)]) -> bool {
+pub(crate) fn in_math(pos: usize, regions: &[(usize, usize)]) -> bool {
     regions
         .binary_search_by(|&(start, end)| {
             if pos < start {
@@ -851,5 +878,71 @@ mod tests {
         assert!(result.contains("text"));
         assert!(!result.contains("addcontentsline"));
         assert!(!result.contains("toc"));
+    }
+
+    // --- \left/\right stripping ---
+
+    #[test]
+    fn test_left_right_parens() {
+        let result = strip_left_right_delimiters(r"\left( x \right)");
+        assert_eq!(result, "( x )");
+    }
+
+    #[test]
+    fn test_left_right_brackets() {
+        let result = strip_left_right_delimiters(r"\left[ x \right]");
+        assert_eq!(result, "[ x ]");
+    }
+
+    #[test]
+    fn test_left_right_braces() {
+        let result = strip_left_right_delimiters(r"\left\{ x \right\}");
+        assert_eq!(result, "{ x }");
+    }
+
+    #[test]
+    fn test_left_right_pipe() {
+        let result = strip_left_right_delimiters(r"\left| x \right|");
+        assert_eq!(result, "| x |");
+    }
+
+    #[test]
+    fn test_left_right_invisible() {
+        let result = strip_left_right_delimiters(r"\left. x \right)");
+        assert_eq!(result, " x )");
+    }
+
+    #[test]
+    fn test_left_right_double_pipe() {
+        let result = strip_left_right_delimiters(r"\left\| x \right\|");
+        assert_eq!(result, "\u{2016} x \u{2016}");
+    }
+
+    #[test]
+    fn test_big_delimiters() {
+        let result = strip_left_right_delimiters(r"\bigl( x \bigr)");
+        assert_eq!(result, "( x )");
+    }
+
+    #[test]
+    fn test_bigg_delimiters() {
+        let result = strip_left_right_delimiters(r"\Biggl( x \Biggr)");
+        assert_eq!(result, "( x )");
+    }
+
+    // --- Stage 5c: additional strip commands ---
+
+    #[test]
+    fn test_geometry_stripped() {
+        let result = strip_pre_diacritic_commands(r"\geometry{margin=1in} text");
+        assert!(result.contains("text"));
+        assert!(!result.contains("geometry"));
+    }
+
+    #[test]
+    fn test_tikzset_stripped() {
+        let result = strip_pre_diacritic_commands(r"\tikzset{foo=bar} text");
+        assert!(result.contains("text"));
+        assert!(!result.contains("tikzset"));
     }
 }

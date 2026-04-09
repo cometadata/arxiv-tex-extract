@@ -278,6 +278,29 @@ fn skip_ws_bytes(bytes: &[u8], pos: usize) -> usize {
     i
 }
 
+/// Normalize common shorthand environment abbreviations.
+///
+/// Some LaTeX documents define shortcuts like `\be` for `\begin{equation}`.
+/// This expands them before macro expansion to ensure they're properly
+/// processed. Uses CommandReplacer for word-boundary safety.
+pub fn normalize_shorthands(text: &str) -> String {
+    static SHORTHANDS: LazyLock<CommandReplacer> = LazyLock::new(|| {
+        CommandReplacer::new(&[
+            ("\\beq", "\\begin{equation}"),
+            ("\\eeq", "\\end{equation}"),
+            ("\\bea", "\\begin{eqnarray}"),
+            ("\\eea", "\\end{eqnarray}"),
+            ("\\bse", "\\begin{subequations}"),
+            ("\\ese", "\\end{subequations}"),
+            ("\\be", "\\begin{equation}"),
+            ("\\ee", "\\end{equation}"),
+            ("\\ba", "\\begin{align}"),
+            ("\\ea", "\\end{align}"),
+        ])
+    });
+    SHORTHANDS.replace_all(text)
+}
+
 /// Size threshold (5MB) above which macro expansion uses fewer iterations
 /// to limit worst-case scanning on large inputs.
 const LARGE_INPUT_THRESHOLD: usize = 5_000_000;
@@ -789,5 +812,34 @@ mod tests {
         let args = vec!["#2".to_string(), "real2".to_string()];
         let result = substitute_args("#1 and #2", &args);
         assert_eq!(result, "#2 and real2");
+    }
+
+    // --- shorthand normalization ---
+
+    #[test]
+    fn test_normalize_shorthands_be() {
+        assert_eq!(normalize_shorthands("\\be x \\ee"), "\\begin{equation} x \\end{equation}");
+    }
+
+    #[test]
+    fn test_normalize_shorthands_bea() {
+        assert_eq!(normalize_shorthands("\\bea x \\eea"), "\\begin{eqnarray} x \\end{eqnarray}");
+    }
+
+    #[test]
+    fn test_normalize_shorthands_ba() {
+        assert_eq!(normalize_shorthands("\\ba x \\ea"), "\\begin{align} x \\end{align}");
+    }
+
+    #[test]
+    fn test_normalize_shorthands_no_collision_begin() {
+        // \begin should NOT be affected by \be
+        assert_eq!(normalize_shorthands("\\begin{document}"), "\\begin{document}");
+    }
+
+    #[test]
+    fn test_normalize_shorthands_no_collision_beta() {
+        // \beta should NOT be affected by \be
+        assert_eq!(normalize_shorthands("\\beta"), "\\beta");
     }
 }

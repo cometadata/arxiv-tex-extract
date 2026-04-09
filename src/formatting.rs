@@ -1,6 +1,8 @@
-use crate::braces::{extract_command_arg, extract_command_arg_tolerant, skip_optional_arg};
+use crate::braces::{extract_command_arg, extract_command_arg_tolerant, extract_optional_arg, skip_optional_arg};
+use crate::cleanup::{find_math_regions, in_math};
 use regex::Regex;
 use std::sync::LazyLock;
+use unicode_normalization::UnicodeNormalization;
 
 /// Commands that wrap content in emphasis: \emph{x} → *x*
 const EMPH_COMMANDS: &[&str] = &["emph", "textit", "textsl"];
@@ -9,13 +11,18 @@ const EMPH_COMMANDS: &[&str] = &["emph", "textit", "textsl"];
 const BOLD_COMMANDS: &[&str] = &["textbf", "mathbf", "boldsymbol", "bm"];
 
 /// Commands that unwrap to just their content: \textrm{x} → x
+///
+/// NOTE: math accents (hat, tilde, bar, vec, dot, ddot, acute, grave, check, breve,
+/// overline, underline) are handled by convert_math_accents() instead.
+/// Math font styles (mathcal, mathbb, mathfrak, mathsf, Bbb) are handled by
+/// convert_symbols() in symbols.rs instead.
 const UNWRAP_COMMANDS: &[&str] = &[
     "textrm", "textsc", "texttt", "textsf", "text", "textnormal",
-    "mathrm", "mathit", "mathcal", "mathbb", "mathfrak", "mathsf",
+    "mathrm", "mathit",
     "operatorname",
-    "cal", "Bbb",
-    "hat", "tilde", "widetilde", "widehat", "bar", "overline",
-    "underline", "vec", "dot", "ddot", "acute", "grave", "check", "breve",
+    "cal",
+    "widetilde", "widehat",
+    "ensuremath",
     "mbox", "hbox", "vbox", "fbox",
     "country",
     "citenamefont", "bibnamefont", "bibfnamefont",
@@ -28,7 +35,7 @@ const UNWRAP_COMMANDS: &[&str] = &[
 ];
 
 /// Two-argument commands where we want the SECOND argument: \textcolor{red}{text} → text
-const TWO_ARG_SECOND: &[&str] = &["textcolor", "colorbox"];
+const TWO_ARG_SECOND: &[&str] = &["textcolor", "colorbox", "texorpdfstring"];
 
 /// Three-argument commands where we want the THIRD argument: \multicolumn{n}{align}{content} → content
 const THREE_ARG_THIRD: &[&str] = &["multicolumn"];
@@ -62,9 +69,217 @@ const SPACE_BEFORE_UPPER: &[&str] = &[
 static FOOTNOTE_MARK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\footnotemark").unwrap());
 
+// ---------------------------------------------------------------------------
+// Math accent combining marks (Stage 2d)
+// ---------------------------------------------------------------------------
+
+/// Math accent commands mapped to their Unicode combining marks.
+const MATH_ACCENT_MAP: &[(&str, char)] = &[
+    ("hat",       '\u{0302}'), // COMBINING CIRCUMFLEX
+    ("tilde",     '\u{0303}'), // COMBINING TILDE
+    ("bar",       '\u{0305}'), // COMBINING OVERLINE
+    ("vec",       '\u{20D7}'), // COMBINING RIGHT ARROW ABOVE
+    ("dot",       '\u{0307}'), // COMBINING DOT ABOVE
+    ("ddot",      '\u{0308}'), // COMBINING DIAERESIS
+    ("acute",     '\u{0301}'), // COMBINING ACUTE
+    ("grave",     '\u{0300}'), // COMBINING GRAVE
+    ("check",     '\u{030C}'), // COMBINING CARON
+    ("breve",     '\u{0306}'), // COMBINING BREVE
+    ("overline",  '\u{0305}'), // COMBINING OVERLINE
+    ("underline", '\u{0332}'), // COMBINING LOW LINE
+];
+
+/// Convert math accent commands to combining marks for single-char arguments,
+/// or plain unwrap for multi-char arguments.
+fn convert_math_accents(text: &str) -> String {
+    let mut result = text.to_string();
+    for &(cmd_name, combining) in MATH_ACCENT_MAP {
+        result = apply_math_accent(&result, cmd_name, combining);
+    }
+    result
+}
+
+fn apply_math_accent(text: &str, cmd_name: &str, combining: char) -> String {
+    let pattern = format!("\\{}", cmd_name);
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    let mut search_start = 0;
+    while let Some(pos) = text[search_start..].find(&pattern) {
+        let abs_pos = search_start + pos;
+        let after = abs_pos + pattern.len();
+        let bytes = text.as_bytes();
+
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+
+        if let Some((cs, ce, after_close)) = extract_command_arg(text, after) {
+            let content = &text[cs..ce];
+            result.push_str(&text[last_end..abs_pos]);
+
+            let chars: Vec<char> = content.chars().collect();
+            if chars.len() == 1 {
+                let composed = format!("{}{}", chars[0], combining);
+                result.push_str(&composed.nfc().collect::<String>());
+            } else {
+                // Multi-character: fall back to plain unwrap
+                result.push_str(content);
+            }
+
+            last_end = after_close;
+            search_start = after_close;
+        } else {
+            search_start = after;
+        }
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Math expression text conversion (Stage 2a-c)
+// ---------------------------------------------------------------------------
+
+static FRAC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\(?:d|t|nice|c)?frac").unwrap());
+
+static BINOM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\(?:t|d)?binom").unwrap());
+
+/// Convert \frac{a}{b} → a/b outside math regions.
+fn convert_text_fractions(text: &str) -> String {
+    let math_regions = find_math_regions(text);
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for mat in FRAC_RE.find_iter(text) {
+        let start = mat.start();
+        if start < last_end {
+            continue;
+        }
+        if in_math(start, &math_regions) {
+            continue;
+        }
+
+        let after = mat.end();
+        if let Some((cs1, ce1, after1)) = extract_command_arg(text, after) {
+            if let Some((cs2, ce2, after2)) = extract_command_arg(text, after1) {
+                result.push_str(&text[last_end..start]);
+                result.push_str(&text[cs1..ce1]);
+                result.push('/');
+                result.push_str(&text[cs2..ce2]);
+                last_end = after2;
+            }
+        }
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// Convert \sqrt{x} → √(x) and \sqrt[n]{x} → √[n](x) outside math regions.
+fn convert_text_sqrt(text: &str) -> String {
+    let math_regions = find_math_regions(text);
+    let pattern = "\\sqrt";
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    let mut search_start = 0;
+
+    while let Some(pos) = text[search_start..].find(pattern) {
+        let abs_pos = search_start + pos;
+        let after = abs_pos + pattern.len();
+        let bytes = text.as_bytes();
+
+        if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
+            search_start = after;
+            continue;
+        }
+        if abs_pos < last_end {
+            search_start = after;
+            continue;
+        }
+        if in_math(abs_pos, &math_regions) {
+            search_start = after;
+            continue;
+        }
+
+        let mut cursor = after;
+        let mut opt_arg = None;
+        if cursor < bytes.len() && bytes[cursor] == b'[' {
+            if let Some((os, oe, after_opt)) = extract_optional_arg(text, cursor) {
+                opt_arg = Some(&text[os..oe]);
+                cursor = after_opt;
+            }
+        }
+
+        if let Some((cs, ce, after_close)) = extract_command_arg(text, cursor) {
+            result.push_str(&text[last_end..abs_pos]);
+            result.push('\u{221A}');
+            if let Some(n) = opt_arg {
+                result.push('[');
+                result.push_str(n);
+                result.push(']');
+            }
+            result.push('(');
+            result.push_str(&text[cs..ce]);
+            result.push(')');
+            last_end = after_close;
+            search_start = after_close;
+        } else {
+            search_start = after;
+        }
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+/// Convert \binom{n}{k} → C(n,k) outside math regions.
+fn convert_text_binom(text: &str) -> String {
+    let math_regions = find_math_regions(text);
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for mat in BINOM_RE.find_iter(text) {
+        let start = mat.start();
+        if start < last_end {
+            continue;
+        }
+        if in_math(start, &math_regions) {
+            continue;
+        }
+
+        let after = mat.end();
+        if let Some((cs1, ce1, after1)) = extract_command_arg(text, after) {
+            if let Some((cs2, ce2, after2)) = extract_command_arg(text, after1) {
+                result.push_str(&text[last_end..start]);
+                result.push_str("C(");
+                result.push_str(&text[cs1..ce1]);
+                result.push(',');
+                result.push_str(&text[cs2..ce2]);
+                result.push(')');
+                last_end = after2;
+            }
+        }
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Main conversion entry point
+// ---------------------------------------------------------------------------
+
 /// Convert LaTeX inline formatting to plaintext/markdown.
 pub fn convert_formatting(text: &str) -> String {
     let mut result = text.to_string();
+
+    // Math accents: apply combining marks before generic unwrap
+    result = convert_math_accents(&result);
 
     for cmd in EMPH_COMMANDS {
         result = replace_single_arg_command(&result, cmd, "*", "*");
@@ -85,6 +300,11 @@ pub fn convert_formatting(text: &str) -> String {
     for cmd in THREE_ARG_THIRD {
         result = replace_three_arg_command(&result, cmd);
     }
+
+    // Math expression conversions (outside math regions only)
+    result = convert_text_fractions(&result);
+    result = convert_text_sqrt(&result);
+    result = convert_text_binom(&result);
 
     for cmd in FONT_SIZE_COMMANDS {
         result = remove_standalone_command(&result, cmd);
@@ -505,18 +725,112 @@ mod tests {
 
     #[test]
     fn test_textsuperscript_letter_passthrough() {
-        // Letters without Unicode superscript equivalents pass through
         let result = convert_formatting(r"\textsuperscript{a}");
         assert_eq!(result, "a");
     }
 
     #[test]
     fn test_tolerant_unclosed_brace() {
-        // Unclosed brace should still extract content rather than lose it
         let result = convert_formatting("\\textbf{unclosed text");
         assert!(
             result.contains("unclosed text"),
             "tolerant should preserve content: {result}"
         );
+    }
+
+    // --- Stage 1c tests ---
+
+    #[test]
+    fn test_ensuremath_unwrap() {
+        let result = convert_formatting(r"\ensuremath{x}");
+        assert_eq!(result, "x");
+    }
+
+    #[test]
+    fn test_texorpdfstring() {
+        let result = convert_formatting(r"\texorpdfstring{$\alpha$}{alpha}");
+        assert_eq!(result, "alpha");
+    }
+
+    // --- Stage 2a-c tests ---
+
+    #[test]
+    fn test_frac_outside_math() {
+        let result = convert_formatting(r"\frac{a}{b}");
+        assert_eq!(result, "a/b");
+    }
+
+    #[test]
+    fn test_dfrac_outside_math() {
+        let result = convert_formatting(r"\dfrac{1}{2}");
+        assert_eq!(result, "1/2");
+    }
+
+    #[test]
+    fn test_frac_inside_math_preserved() {
+        let result = convert_formatting(r"$\frac{a}{b}$");
+        assert_eq!(result, r"$\frac{a}{b}$");
+    }
+
+    #[test]
+    fn test_sqrt_outside_math() {
+        let result = convert_formatting(r"\sqrt{x}");
+        assert_eq!(result, "\u{221A}(x)");
+    }
+
+    #[test]
+    fn test_sqrt_with_optional() {
+        let result = convert_formatting(r"\sqrt[3]{x}");
+        assert_eq!(result, "\u{221A}[3](x)");
+    }
+
+    #[test]
+    fn test_sqrt_inside_math_preserved() {
+        let result = convert_formatting(r"$\sqrt{x}$");
+        assert_eq!(result, r"$\sqrt{x}$");
+    }
+
+    #[test]
+    fn test_binom_outside_math() {
+        let result = convert_formatting(r"\binom{n}{k}");
+        assert_eq!(result, "C(n,k)");
+    }
+
+    #[test]
+    fn test_binom_inside_math_preserved() {
+        let result = convert_formatting(r"$\binom{n}{k}$");
+        assert_eq!(result, r"$\binom{n}{k}$");
+    }
+
+    // --- Stage 2d tests ---
+
+    #[test]
+    fn test_hat_single_char() {
+        let result = convert_formatting(r"\hat{x}");
+        assert_eq!(result, "x\u{0302}");
+    }
+
+    #[test]
+    fn test_vec_single_char() {
+        let result = convert_formatting(r"\vec{v}");
+        assert_eq!(result, "v\u{20D7}");
+    }
+
+    #[test]
+    fn test_accent_multi_char_unwraps() {
+        let result = convert_formatting(r"\hat{abc}");
+        assert_eq!(result, "abc");
+    }
+
+    #[test]
+    fn test_overline_single_char() {
+        let result = convert_formatting(r"\overline{x}");
+        assert_eq!(result, "x\u{0305}");
+    }
+
+    #[test]
+    fn test_underline_single_char() {
+        let result = convert_formatting(r"\underline{x}");
+        assert_eq!(result, "x\u{0332}");
     }
 }

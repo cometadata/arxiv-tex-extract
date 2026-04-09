@@ -53,6 +53,15 @@ static SPECIAL_CHARS_BARE: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\L", "Ł"),
         ("\\i", "ı"),
         ("\\j", "ȷ"),
+        // Special Latin characters
+        ("\\DJ", "Đ"),
+        ("\\dj", "đ"),
+        ("\\TH", "Þ"),
+        ("\\th", "þ"),
+        ("\\DH", "Ð"),
+        ("\\dh", "ð"),
+        ("\\NG", "Ŋ"),
+        ("\\ng", "ŋ"),
     ])
 });
 

@@ -6,7 +6,7 @@ use crate::formatting::convert_formatting;
 use crate::input_resolve::{resolve_and_order, TexFile};
 use crate::macros::{
     collect_macros, collect_newtheorems, collect_parametric_macros, expand_macros,
-    expand_parametric_macros, ParametricMacro,
+    expand_parametric_macros, normalize_shorthands, ParametricMacro,
 };
 use crate::preamble::extract_body;
 use crate::references::convert_references;
@@ -107,6 +107,7 @@ fn clean_tex_file(
     };
 
     body = timings.time("remove_comments", || remove_comments(&body));
+    body = timings.time("normalize_shorthands", || normalize_shorthands(&body));
     body = timings.time("expand_macros", || expand_macros(&body, &ctx.macros));
     body = timings.time("expand_parametric", || {
         expand_parametric_macros(&body, &ctx.parametric_macros)
