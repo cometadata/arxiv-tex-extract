@@ -8,9 +8,10 @@ static GLOBAL: Jemalloc = Jemalloc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -85,6 +86,10 @@ struct Args {
     /// Emit _metrics.json sidecar files per shard
     #[arg(long)]
     metrics: bool,
+
+    /// Read tar paths from stdin (one per line), process each with Rayon
+    #[arg(long)]
+    manifest_stdin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -156,7 +161,13 @@ fn main() -> Result<()> {
 
     let format = OutputFormat::parse(&args.output_format)?;
 
-    if let Some(input_file) = &args.input_file {
+    if args.manifest_stdin {
+        let output_dir = args
+            .output_dir
+            .as_ref()
+            .context("--output-dir is required with --manifest-stdin")?;
+        process_stdin_manifest(output_dir, timeout, max_tex_bytes, max_memory_bytes, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics)?;
+    } else if let Some(input_file) = &args.input_file {
         if input_file.is_dir() {
             let output_dir = args
                 .output_dir
@@ -173,7 +184,7 @@ fn main() -> Result<()> {
             .context("--output-dir is required in batch mode")?;
         process_batch(input_dir, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics)?;
     } else {
-        anyhow::bail!("Either --input-dir or --input-file must be specified");
+        anyhow::bail!("Either --input-dir, --input-file, or --manifest-stdin must be specified");
     }
 
     log_memory_stats();
@@ -256,6 +267,132 @@ fn process_batch(
     } else {
         process_individual_archives(&archive_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, emit_metrics)?;
     }
+
+    Ok(())
+}
+
+/// Process tar files streamed via stdin (one path per line).
+///
+/// A reader thread reads paths from stdin and sends them through a bounded
+/// channel. Rayon workers consume paths via `par_bridge()` and process each
+/// tar identically to the directory-based mode. When stdin closes (EOF),
+/// the reader drops the sender and workers drain remaining work.
+fn process_stdin_manifest(
+    output_dir: &Path,
+    timeout: Duration,
+    max_tex_bytes: usize,
+    max_memory_bytes: Option<usize>,
+    format: OutputFormat,
+    max_shard_rows: usize,
+    max_shard_bytes: usize,
+    resume: bool,
+    emit_metrics: bool,
+) -> Result<()> {
+    fs::create_dir_all(output_dir)?;
+    let checkpoint_path = output_dir.join("checkpoint.log");
+
+    let completed = if resume {
+        let set = checkpoint::load_checkpoint(&checkpoint_path)?;
+        if !set.is_empty() {
+            info!("Resuming: {} tars already completed", set.len());
+        }
+        set
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let counts = Arc::new(Mutex::new(StatusCounts::default()));
+    let processed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Bounded channel — reader blocks when 8 paths are buffered
+    let (tx, rx) = mpsc::sync_channel::<PathBuf>(8);
+
+    // Stdin reader thread
+    let reader_handle = thread::spawn(move || {
+        let stdin = io::stdin();
+        let reader = io::BufReader::new(stdin.lock());
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    let trimmed = line.trim().to_string();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let path = PathBuf::from(&trimmed);
+                    let tar_name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if completed.contains(&tar_name) {
+                        info!("Skipping already-completed: {}", tar_name);
+                        continue;
+                    }
+                    if tx.send(path).is_err() {
+                        break; // receiver dropped
+                    }
+                }
+                Err(e) => {
+                    error!("stdin read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::default_spinner()
+            .template("[{elapsed_precise}] {spinner} {pos} tars processed")
+            .unwrap(),
+    );
+
+    let cp_path = checkpoint_path.clone();
+    let counts_ref = counts.clone();
+    let pc = processed_count.clone();
+
+    rx.into_iter().par_bridge().for_each(|tar_path| {
+        match process_outer_tar(
+            &tar_path, output_dir, timeout, max_tex_bytes, max_memory_bytes,
+            format, max_shard_rows, max_shard_bytes, emit_metrics,
+        ) {
+            Ok(tar_counts) => {
+                counts_ref.lock().unwrap().merge(&tar_counts);
+                let tar_name = tar_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if let Err(e) = checkpoint::record_checkpoint(&cp_path, &tar_name) {
+                    error!("Checkpoint write error: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to process {}: {}", tar_path.display(), e);
+                let tar_name = tar_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                counts_ref.lock().unwrap().record(Outcome::ArchiveError, &tar_name);
+            }
+        }
+        pc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        progress.inc(1);
+    });
+
+    progress.finish();
+
+    reader_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdin reader thread panicked"))?;
+
+    let c = counts.lock().unwrap();
+    c.log_summary(&format!(
+        "Done: {} tars, {} papers",
+        pc.load(std::sync::atomic::Ordering::Relaxed),
+        c.total()
+    ));
 
     Ok(())
 }
