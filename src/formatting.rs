@@ -1,7 +1,9 @@
 use crate::braces::{extract_command_arg, extract_command_arg_tolerant, extract_optional_arg, skip_optional_arg};
 use crate::cleanup::{find_math_regions, in_math};
+use crate::timing::deadline_expired;
 use regex::Regex;
 use std::sync::LazyLock;
+use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
 /// Commands that wrap content in emphasis: \emph{x} → *x*
@@ -412,16 +414,18 @@ fn convert_text_binom(text: &str) -> String {
 }
 
 /// Convert LaTeX inline formatting to plaintext/markdown.
-pub fn convert_formatting(text: &str) -> String {
+pub fn convert_formatting(text: &str, deadline: Option<Instant>) -> String {
     let mut result = text.to_string();
 
     // Inline verbatim: extract before any other processing
     result = convert_inline_verb(&result);
     result = convert_lstinline(&result);
     result = convert_mintinline(&result);
+    if deadline_expired(deadline) { return result; }
 
     // Math accents: apply combining marks before generic unwrap
     result = convert_math_accents(&result);
+    if deadline_expired(deadline) { return result; }
 
     for cmd in EMPH_COMMANDS {
         result = replace_single_arg_command(&result, cmd, "*", "*");
@@ -430,10 +434,12 @@ pub fn convert_formatting(text: &str) -> String {
     for cmd in BOLD_COMMANDS {
         result = replace_single_arg_command(&result, cmd, "**", "**");
     }
+    if deadline_expired(deadline) { return result; }
 
     for cmd in UNWRAP_COMMANDS {
         result = replace_single_arg_command(&result, cmd, "", "");
     }
+    if deadline_expired(deadline) { return result; }
 
     for cmd in TWO_ARG_SECOND {
         result = replace_two_arg_command(&result, cmd);
@@ -442,11 +448,13 @@ pub fn convert_formatting(text: &str) -> String {
     for cmd in THREE_ARG_THIRD {
         result = replace_three_arg_command(&result, cmd);
     }
+    if deadline_expired(deadline) { return result; }
 
     // Math expression conversions (outside math regions only)
     result = convert_text_fractions(&result);
     result = convert_text_sqrt(&result);
     result = convert_text_binom(&result);
+    if deadline_expired(deadline) { return result; }
 
     for cmd in FONT_SIZE_COMMANDS {
         result = remove_standalone_command(&result, cmd);
@@ -455,6 +463,7 @@ pub fn convert_formatting(text: &str) -> String {
     for cmd in INLINE_COMMANDS {
         result = replace_single_arg_command(&result, cmd, " ", " ");
     }
+    if deadline_expired(deadline) { return result; }
 
     for cmd in STRIP_COMMANDS {
         result = strip_command_entirely(&result, cmd);
@@ -878,103 +887,103 @@ mod tests {
 
     #[test]
     fn test_emph() {
-        let result = convert_formatting(r"\emph{hello}");
+        let result = convert_formatting(r"\emph{hello}", None);
         assert_eq!(result, "*hello*");
     }
 
     #[test]
     fn test_textbf() {
-        let result = convert_formatting(r"\textbf{bold}");
+        let result = convert_formatting(r"\textbf{bold}", None);
         assert_eq!(result, "**bold**");
     }
 
     #[test]
     fn test_textrm() {
-        let result = convert_formatting(r"\textrm{normal}");
+        let result = convert_formatting(r"\textrm{normal}", None);
         assert_eq!(result, "normal");
     }
 
     #[test]
     fn test_nested_formatting() {
-        let result = convert_formatting(r"\textbf{\emph{nested}}");
+        let result = convert_formatting(r"\textbf{\emph{nested}}", None);
         assert_eq!(result, "***nested***");
     }
 
     #[test]
     fn test_textcolor_extracts_second_arg() {
-        let result = convert_formatting(r"\textcolor{red}{visible text}");
+        let result = convert_formatting(r"\textcolor{red}{visible text}", None);
         assert_eq!(result, "visible text");
     }
 
     #[test]
     fn test_colorbox_extracts_second_arg() {
-        let result = convert_formatting(r"\colorbox{yellow}{highlighted}");
+        let result = convert_formatting(r"\colorbox{yellow}{highlighted}", None);
         assert_eq!(result, "highlighted");
     }
 
     #[test]
     fn test_multicolumn_extracts_third_arg() {
-        let result = convert_formatting(r"\multicolumn{3}{c}{Header}");
+        let result = convert_formatting(r"\multicolumn{3}{c}{Header}", None);
         assert_eq!(result, "Header");
     }
 
     #[test]
     fn test_footnote() {
-        let result = convert_formatting(r"text\footnote{note}more");
+        let result = convert_formatting(r"text\footnote{note}more", None);
         assert_eq!(result, "text note more");
     }
 
     #[test]
     fn test_thanks() {
-        let result = convert_formatting(r"author\thanks{grant info}");
+        let result = convert_formatting(r"author\thanks{grant info}", None);
         assert_eq!(result, "author grant info ");
     }
 
     #[test]
     fn test_font_size_removed() {
-        let result = convert_formatting(r"\large text");
+        let result = convert_formatting(r"\large text", None);
         assert_eq!(result, " text");
     }
 
     #[test]
     fn test_nested_braces_in_formatting() {
-        let result = convert_formatting(r"\emph{a {b} c}");
+        let result = convert_formatting(r"\emph{a {b} c}", None);
         assert_eq!(result, "*a {b} c*");
     }
 
     #[test]
     fn test_corauthref_stripped() {
-        let result = convert_formatting(r"Name \corauthref{cor2} rest");
+        let result = convert_formatting(r"Name \corauthref{cor2} rest", None);
         assert_eq!(result, "Name  rest");
     }
 
     #[test]
     fn test_textsuperscript_digits() {
-        let result = convert_formatting(r"Zhou\textsuperscript{1}");
+        let result = convert_formatting(r"Zhou\textsuperscript{1}", None);
         assert_eq!(result, "Zhou\u{00B9}");
     }
 
     #[test]
     fn test_textsuperscript_multi() {
-        let result = convert_formatting(r"x\textsuperscript{23}");
+        let result = convert_formatting(r"x\textsuperscript{23}", None);
         assert_eq!(result, "x\u{00B2}\u{00B3}");
     }
 
     #[test]
     fn test_textsubscript_digits() {
-        let result = convert_formatting(r"H\textsubscript{2}O");
+        let result = convert_formatting(r"H\textsubscript{2}O", None);
         assert_eq!(result, "H\u{2082}O");
     }
 
     #[test]
     fn test_textsuperscript_letter_passthrough() {
-        let result = convert_formatting(r"\textsuperscript{a}");
+        let result = convert_formatting(r"\textsuperscript{a}", None);
         assert_eq!(result, "a");
     }
 
     #[test]
     fn test_tolerant_unclosed_brace() {
-        let result = convert_formatting("\\textbf{unclosed text");
+        let result = convert_formatting("\\textbf{unclosed text", None);
         assert!(
             result.contains("unclosed text"),
             "tolerant should preserve content: {result}"
@@ -983,116 +992,116 @@ mod tests {
 
     #[test]
     fn test_ensuremath_unwrap() {
-        let result = convert_formatting(r"\ensuremath{x}");
+        let result = convert_formatting(r"\ensuremath{x}", None);
         assert_eq!(result, "x");
     }
 
     #[test]
     fn test_texorpdfstring() {
-        let result = convert_formatting(r"\texorpdfstring{$\alpha$}{alpha}");
+        let result = convert_formatting(r"\texorpdfstring{$\alpha$}{alpha}", None);
         assert_eq!(result, "alpha");
     }
 
     #[test]
     fn test_frac_outside_math() {
-        let result = convert_formatting(r"\frac{a}{b}");
+        let result = convert_formatting(r"\frac{a}{b}", None);
         assert_eq!(result, "a/b");
     }
 
     #[test]
     fn test_dfrac_outside_math() {
-        let result = convert_formatting(r"\dfrac{1}{2}");
+        let result = convert_formatting(r"\dfrac{1}{2}", None);
         assert_eq!(result, "1/2");
     }
 
     #[test]
     fn test_frac_inside_math_preserved() {
-        let result = convert_formatting(r"$\frac{a}{b}$");
+        let result = convert_formatting(r"$\frac{a}{b}$", None);
         assert_eq!(result, r"$\frac{a}{b}$");
     }
 
     #[test]
     fn test_sqrt_outside_math() {
-        let result = convert_formatting(r"\sqrt{x}");
+        let result = convert_formatting(r"\sqrt{x}", None);
         assert_eq!(result, "\u{221A}(x)");
     }
 
     #[test]
     fn test_sqrt_with_optional() {
-        let result = convert_formatting(r"\sqrt[3]{x}");
+        let result = convert_formatting(r"\sqrt[3]{x}", None);
         assert_eq!(result, "\u{221A}[3](x)");
     }
 
     #[test]
     fn test_sqrt_inside_math_preserved() {
-        let result = convert_formatting(r"$\sqrt{x}$");
+        let result = convert_formatting(r"$\sqrt{x}$", None);
         assert_eq!(result, r"$\sqrt{x}$");
     }
 
     #[test]
     fn test_binom_outside_math() {
-        let result = convert_formatting(r"\binom{n}{k}");
+        let result = convert_formatting(r"\binom{n}{k}", None);
         assert_eq!(result, "C(n,k)");
     }
 
     #[test]
     fn test_binom_inside_math_preserved() {
-        let result = convert_formatting(r"$\binom{n}{k}$");
+        let result = convert_formatting(r"$\binom{n}{k}$", None);
         assert_eq!(result, r"$\binom{n}{k}$");
     }
 
     #[test]
     fn test_hat_single_char() {
-        let result = convert_formatting(r"\hat{x}");
+        let result = convert_formatting(r"\hat{x}", None);
         assert_eq!(result, "x\u{0302}");
     }
 
     #[test]
     fn test_vec_single_char() {
-        let result = convert_formatting(r"\vec{v}");
+        let result = convert_formatting(r"\vec{v}", None);
         assert_eq!(result, "v\u{20D7}");
     }
 
     #[test]
     fn test_accent_multi_char_unwraps() {
-        let result = convert_formatting(r"\hat{abc}");
+        let result = convert_formatting(r"\hat{abc}", None);
         assert_eq!(result, "abc");
     }
 
     #[test]
     fn test_overline_single_char() {
-        let result = convert_formatting(r"\overline{x}");
+        let result = convert_formatting(r"\overline{x}", None);
         assert_eq!(result, "x\u{0305}");
     }
 
     #[test]
     fn test_underline_single_char() {
-        let result = convert_formatting(r"\underline{x}");
+        let result = convert_formatting(r"\underline{x}", None);
         assert_eq!(result, "x\u{0332}");
     }
 
     #[test]
     fn test_verb_pipe() {
-        let result = convert_formatting(r"\verb|hello world|");
+        let result = convert_formatting(r"\verb|hello world|", None);
         assert_eq!(result, "hello world");
     }
 
     #[test]
     fn test_verb_star() {
-        let result = convert_formatting(r"\verb*|code here|");
+        let result = convert_formatting(r"\verb*|code here|", None);
         assert_eq!(result, "code here");
     }
 
     #[test]
     fn test_verb_bang_delimiter() {
-        let result = convert_formatting(r"\verb!special!");
+        let result = convert_formatting(r"\verb!special!", None);
         assert_eq!(result, "special");
     }
 
     #[test]
     fn test_verb_boundary() {
         // \verbatim should NOT match as \verb
-        let result = convert_formatting(r"\verbatim{text}");
+        let result = convert_formatting(r"\verbatim{text}", None);
         assert!(result.contains("verbatim") || result.contains("text"));
     }
 
@@ -1100,67 +1109,67 @@ mod tests {
     fn test_verb_multibyte_delimiter() {
         // Multi-byte UTF-8 char adjacent to \verb must not panic
         let input = "before \\verb·code· after";
-        let result = convert_formatting(input);
+        let result = convert_formatting(input, None);
         assert_eq!(result, "before code after");
     }
 
     #[test]
     fn test_lstinline_braced() {
-        let result = convert_formatting(r"\lstinline{x = 1}");
+        let result = convert_formatting(r"\lstinline{x = 1}", None);
         assert_eq!(result, "x = 1");
     }
 
     #[test]
     fn test_lstinline_delimiter() {
-        let result = convert_formatting(r"\lstinline|x = 1|");
+        let result = convert_formatting(r"\lstinline|x = 1|", None);
         assert_eq!(result, "x = 1");
     }
 
     #[test]
     fn test_mintinline() {
-        let result = convert_formatting(r"\mintinline{python}{x = 1}");
+        let result = convert_formatting(r"\mintinline{python}{x = 1}", None);
         assert_eq!(result, "x = 1");
     }
 
     #[test]
     fn test_ket() {
-        let result = convert_formatting(r"\ket{0}");
+        let result = convert_formatting(r"\ket{0}", None);
         assert!(result.contains("|") && result.contains("\u{27E9}"), "ket: {result}");
     }
 
     #[test]
     fn test_bra() {
-        let result = convert_formatting(r"\bra{0}");
+        let result = convert_formatting(r"\bra{0}", None);
         assert!(result.contains("\u{27E8}") && result.contains("|"), "bra: {result}");
     }
 
     #[test]
     fn test_braket() {
-        let result = convert_formatting(r"\braket{x}{y}");
+        let result = convert_formatting(r"\braket{x}{y}", None);
         assert!(result.contains("\u{27E8}") && result.contains("|") && result.contains("\u{27E9}"), "braket: {result}");
     }
 
     #[test]
     fn test_ketbra() {
-        let result = convert_formatting(r"\ketbra{x}{y}");
+        let result = convert_formatting(r"\ketbra{x}{y}", None);
         assert!(result.contains("|x\u{27E9}") && result.contains("\u{27E8}y|"), "ketbra: {result}");
     }
 
     #[test]
     fn test_dddot_single_char() {
-        let result = convert_formatting(r"\dddot{x}");
+        let result = convert_formatting(r"\dddot{x}", None);
         assert!(result.contains("x") && result.contains("\u{20DB}"), "dddot: {result}");
     }
 
     #[test]
     fn test_ddddot_single_char() {
-        let result = convert_formatting(r"\ddddot{x}");
+        let result = convert_formatting(r"\ddddot{x}", None);
         assert!(result.contains("x") && result.contains("\u{20DC}"), "ddddot: {result}");
     }
 
     #[test]
     fn test_endnote() {
-        let result = convert_formatting(r"text\endnote{a note}more");
+        let result = convert_formatting(r"text\endnote{a note}more", None);
         assert_eq!(result, "text a note more");
     }
 }

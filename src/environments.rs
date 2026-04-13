@@ -1,7 +1,9 @@
 use crate::braces::{extract_command_arg, skip_optional_arg};
+use crate::timing::deadline_expired;
 use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 static ITEM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\item\s*(?:\[([^\]]*)\])?").unwrap());
@@ -101,7 +103,7 @@ const DISCARD_ENVS: &[&str] = &[
 
 /// Convert LaTeX environments to readable form.
 /// `custom_theorems` maps env names (e.g. "dfn") to display names (e.g. "Definition").
-pub fn convert_environments(text: &str, custom_theorems: &HashMap<String, String>) -> String {
+pub fn convert_environments(text: &str, custom_theorems: &HashMap<String, String>, deadline: Option<Instant>) -> String {
     let mut result = text.to_string();
 
     for env in LIST_ENVS {
@@ -110,6 +112,7 @@ pub fn convert_environments(text: &str, custom_theorems: &HashMap<String, String
     result = convert_items(&result);
 
     result = convert_all_floats(&result);
+    if deadline_expired(deadline) { return result; }
 
     for env in QUOTE_ENVS {
         result = remove_env_markers(&result, env);
@@ -127,6 +130,7 @@ pub fn convert_environments(text: &str, custom_theorems: &HashMap<String, String
             result = convert_custom_theorem_env(&result, env_name, display_name);
         }
     }
+    if deadline_expired(deadline) { return result; }
 
     let mut eq_counter = 0usize;
     for env in MATH_ENVS {
@@ -138,6 +142,7 @@ pub fn convert_environments(text: &str, custom_theorems: &HashMap<String, String
     }
 
     result = clean_math_display_interiors(&result);
+    if deadline_expired(deadline) { return result; }
 
     result = DISPLAY_MATH_OPEN_RE.replace_all(&result, "\n$$$$\n").to_string();
     result = DISPLAY_MATH_CLOSE_RE.replace_all(&result, "\n$$$$\n").to_string();
@@ -150,6 +155,7 @@ pub fn convert_environments(text: &str, custom_theorems: &HashMap<String, String
         result = remove_env_markers(&result, env);
     }
     result = ALGO_COMMAND_RE.replace_all(&result, "").to_string();
+    if deadline_expired(deadline) { return result; }
 
     for env in KEYWORD_ENVS {
         result = convert_keyword_env(&result, env);
@@ -735,7 +741,7 @@ mod tests {
     use super::*;
 
     fn ce(text: &str) -> String {
-        convert_environments(text, &HashMap::new())
+        convert_environments(text, &HashMap::new(), None)
     }
 
     #[test]
@@ -971,7 +977,7 @@ mod tests {
         let mut custom = HashMap::new();
         custom.insert("dfn".to_string(), "Definition".to_string());
         let input = r"\begin{dfn}[Key]A definition.\end{dfn}";
-        let result = convert_environments(input, &custom);
+        let result = convert_environments(input, &custom, None);
         assert!(result.contains("**Definition (Key).**"), "custom theorem: {result}");
         assert!(result.contains("A definition."));
     }
@@ -981,7 +987,7 @@ mod tests {
         let mut custom = HashMap::new();
         custom.insert("cor".to_string(), "Corollary".to_string());
         let input = r"\begin{cor}A corollary.\end{cor}";
-        let result = convert_environments(input, &custom);
+        let result = convert_environments(input, &custom, None);
         assert!(result.contains("**Corollary.**"), "custom theorem: {result}");
     }
 
@@ -1035,7 +1041,7 @@ mod tests {
         let input = r"\begin{tikzpicture}
 \draw (0,0) -- (1,1);
 \end{tikzpicture} text after";
-        let result = convert_environments(input, &std::collections::HashMap::new());
+        let result = convert_environments(input, &std::collections::HashMap::new(), None);
         assert!(!result.contains("draw"), "tikz should be discarded: {result}");
         assert!(result.contains("text after"));
     }
@@ -1046,7 +1052,7 @@ mod tests {
 \item First
 \item Second
 \end{compactitem}";
-        let result = convert_environments(input, &std::collections::HashMap::new());
+        let result = convert_environments(input, &std::collections::HashMap::new(), None);
         assert!(result.contains("First") && result.contains("Second"));
     }
 }

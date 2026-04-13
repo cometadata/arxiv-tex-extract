@@ -1,4 +1,5 @@
 use std::time::Instant;
+use tracing::trace;
 
 /// Returns true if the deadline has passed.
 #[inline]
@@ -24,6 +25,7 @@ impl StageTimings {
     where
         F: FnOnce() -> R,
     {
+        trace!(stage = name, "entering stage");
         let start = Instant::now();
         let result = f();
         self.entries.push((name, start.elapsed().as_micros() as u64));

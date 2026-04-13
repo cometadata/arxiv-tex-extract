@@ -16,6 +16,7 @@ use crate::timing::{deadline_expired, StageTimings};
 
 use std::collections::HashMap;
 use std::time::Instant;
+use tracing::trace;
 
 /// State threaded through the pipeline to share data between stages.
 pub struct PipelineContext {
@@ -74,6 +75,7 @@ pub fn extract_text_timed(tex_files: &[TexFile], deadline: Option<Instant>) -> E
         if deadline_expired(deadline) {
             return ExtractionOutput { text: None, timings };
         }
+        trace!(file = %file.name, bytes = file.content.len(), "processing tex file");
         match clean_tex_file(&file.content, &mut ctx, &mut timings, deadline) {
             Some(cleaned) if !cleaned.is_empty() => parts.push(cleaned),
             _ => {}
@@ -139,21 +141,21 @@ fn clean_tex_file(
         convert_references(&body, &ctx.section_label_map)
     });
     check_deadline!();
-    body = timings.time("convert_formatting", || convert_formatting(&body));
+    body = timings.time("convert_formatting", || convert_formatting(&body, deadline));
     check_deadline!();
     body = timings.time("convert_environments", || {
-        convert_environments(&body, &ctx.custom_theorems)
+        convert_environments(&body, &ctx.custom_theorems, deadline)
     });
     check_deadline!();
     body = timings.time("strip_pre_diacritic", || {
-        strip_pre_diacritic_commands(&body)
+        strip_pre_diacritic_commands(&body, deadline)
     });
     check_deadline!();
     body = timings.time("convert_diacritics", || convert_diacritics(&body));
     check_deadline!();
     body = timings.time("convert_symbols", || convert_symbols(&body));
     check_deadline!();
-    body = timings.time("cleanup", || cleanup(&body));
+    body = timings.time("cleanup", || cleanup(&body, deadline));
 
     if body.trim().is_empty() {
         None

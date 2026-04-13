@@ -1,8 +1,10 @@
 use crate::braces::{extract_command_arg, find_command_end};
 use crate::environments::MATH_ENVS;
+use crate::timing::deadline_expired;
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 /// Regex to strip `\left`, `\right`, and `\big` sizing decorators from delimiters.
 static LEFT_RIGHT_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -99,7 +101,7 @@ const STRIP_WITH_ARGS: &[(&str, usize)] = &[
 ///
 /// Must run BEFORE `convert_diacritics()` so that commands like `\vskip`,
 /// `\bf`, `\baselineskip` are gone before bare-accent regexes fire.
-pub fn strip_pre_diacritic_commands(text: &str) -> String {
+pub fn strip_pre_diacritic_commands(text: &str, deadline: Option<Instant>) -> String {
     let mut result = text.to_string();
 
     result = strip_left_right_delimiters(&result);
@@ -107,14 +109,17 @@ pub fn strip_pre_diacritic_commands(text: &str) -> String {
     result = LENGTH_ASSIGN_RE.replace_all(&result, " ").to_string();
 
     for cmd in FONT_SWITCHES {
+        if deadline_expired(deadline) { return result; }
         result = remove_font_switch(&result, cmd);
     }
 
     for cmd in NOOP_COMMANDS {
+        if deadline_expired(deadline) { return result; }
         result = remove_font_switch(&result, cmd);
     }
 
     for &(cmd, n_args) in STRIP_WITH_ARGS {
+        if deadline_expired(deadline) { return result; }
         result = strip_command_with_args(&result, cmd, n_args);
     }
 
@@ -411,10 +416,11 @@ fn reflow_paragraphs(text: &str) -> String {
 }
 
 /// Final cleanup pass.
-pub fn cleanup(text: &str) -> String {
+pub fn cleanup(text: &str, deadline: Option<Instant>) -> String {
     let mut result = text.to_string();
 
     for cmd in SPACING_COMMANDS {
+        if deadline_expired(deadline) { return result; }
         result = remove_spacing_command(&result, cmd);
     }
 
@@ -424,12 +430,14 @@ pub fn cleanup(text: &str) -> String {
 
     // Second pass catches font switches that leak through nested unwrapping
     for cmd in FONT_SWITCHES {
+        if deadline_expired(deadline) { return result; }
         result = remove_font_switch(&result, cmd);
     }
 
     result = result.replace("\\protect", "");
     result = NEWCOMMAND_LEAKED_RE.replace_all(&result, "").to_string();
     result = DEF_LEAKED_RE.replace_all(&result, "").to_string();
+    if deadline_expired(deadline) { return result; }
 
     for _ in 0..2 {
         result = unwrap_generic_commands(&result);
@@ -637,104 +645,104 @@ mod tests {
 
     #[test]
     fn test_spacing_commands() {
-        assert_eq!(cleanup(r"\quad text"), "text");
-        assert_eq!(cleanup(r"\hspace{1cm}text"), "text");
+        assert_eq!(cleanup(r"\quad text", None), "text");
+        assert_eq!(cleanup(r"\hspace{1cm}text", None), "text");
     }
 
     #[test]
     fn test_line_break() {
-        let result = cleanup(r"line1\\line2");
+        let result = cleanup(r"line1\\line2", None);
         assert!(result.contains("line1"));
         assert!(result.contains("line2"));
     }
 
     #[test]
     fn test_phantom_removed() {
-        assert_eq!(cleanup(r"\phantom{x}text"), "text");
+        assert_eq!(cleanup(r"\phantom{x}text", None), "text");
     }
 
     #[test]
     fn test_font_switch() {
-        let result = cleanup(r"{\it italic}");
+        let result = cleanup(r"{\it italic}", None);
         assert_eq!(result, "italic");
     }
 
     #[test]
     fn test_protect_removed() {
-        let result = cleanup(r"\protect\foo{bar}");
+        let result = cleanup(r"\protect\foo{bar}", None);
         assert_eq!(result, "bar");
     }
 
     #[test]
     fn test_generic_unwrap() {
-        let result = cleanup(r"\unknown{content}");
+        let result = cleanup(r"\unknown{content}", None);
         assert_eq!(result, "content");
     }
 
     #[test]
     fn test_grouping_braces() {
-        let result = cleanup("some {grouped} text");
+        let result = cleanup("some {grouped} text", None);
         assert_eq!(result, "some grouped text");
     }
 
     #[test]
     fn test_orphan_command_removed() {
-        let result = cleanup(r"\somecommand rest");
+        let result = cleanup(r"\somecommand rest", None);
         assert!(result.contains("rest"));
         assert!(!result.contains("somecommand"));
     }
 
     #[test]
     fn test_math_command_preserved() {
-        let result = cleanup(r"\frac rest");
+        let result = cleanup(r"\frac rest", None);
         assert!(result.contains("\\frac"));
     }
 
     #[test]
     fn test_whitespace_collapse() {
-        let result = cleanup("a   b   c");
+        let result = cleanup("a   b   c", None);
         assert_eq!(result, "a b c");
     }
 
     #[test]
     fn test_blank_line_collapse() {
-        let result = cleanup("a\n\n\n\nb");
+        let result = cleanup("a\n\n\n\nb", None);
         assert_eq!(result, "a\n\nb");
     }
 
     #[test]
     fn test_leaked_newcommand() {
-        let result = cleanup(r"\newcommand{\foo}{bar} text");
+        let result = cleanup(r"\newcommand{\foo}{bar} text", None);
         assert_eq!(result.trim(), "text");
     }
 
     #[test]
     fn test_math_subscript_preserved() {
-        let result = cleanup(r"$X_{max}$");
+        let result = cleanup(r"$X_{max}$", None);
         assert_eq!(result, r"$X_{max}$");
     }
 
     #[test]
     fn test_math_frac_preserved() {
-        let result = cleanup(r"$\frac{1}{2}$");
+        let result = cleanup(r"$\frac{1}{2}$", None);
         assert_eq!(result, r"$\frac{1}{2}$");
     }
 
     #[test]
     fn test_math_sqrt_preserved() {
-        let result = cleanup(r"$\sqrt{x+1}$");
+        let result = cleanup(r"$\sqrt{x+1}$", None);
         assert_eq!(result, r"$\sqrt{x+1}$");
     }
 
     #[test]
     fn test_display_math_frac_preserved() {
-        let result = cleanup(r"$$\frac{a}{b}$$");
+        let result = cleanup(r"$$\frac{a}{b}$$", None);
         assert_eq!(result, r"$$\frac{a}{b}$$");
     }
 
     #[test]
     fn test_non_math_still_unwraps() {
-        let result = cleanup(r"\unknown{content}");
+        let result = cleanup(r"\unknown{content}", None);
         assert_eq!(result, "content");
     }
 
@@ -742,7 +750,7 @@ mod tests {
     fn test_inline_math_paren_content_preserved() {
         // \( and \) lose backslashes via strip_stray_backslashes,
         // but the math content inside must be preserved
-        let result = cleanup(r"\(\frac{x}{y}\)");
+        let result = cleanup(r"\(\frac{x}{y}\)", None);
         assert!(result.contains(r"\frac{x}{y}"));
     }
 
@@ -812,28 +820,28 @@ mod tests {
 
     #[test]
     fn test_pre_diacritic_vskip() {
-        let result = strip_pre_diacritic_commands(r"\vskip 1cm some text");
+        let result = strip_pre_diacritic_commands(r"\vskip 1cm some text", None);
         assert!(result.contains("some text"));
         assert!(!result.contains("vskip"));
     }
 
     #[test]
     fn test_pre_diacritic_baselineskip() {
-        let result = strip_pre_diacritic_commands(r"\baselineskip=16pt some text");
+        let result = strip_pre_diacritic_commands(r"\baselineskip=16pt some text", None);
         assert!(result.contains("some text"));
         assert!(!result.contains("baselineskip"));
     }
 
     #[test]
     fn test_pre_diacritic_font_switches() {
-        let result = strip_pre_diacritic_commands(r"{\bf bold text}");
+        let result = strip_pre_diacritic_commands(r"{\bf bold text}", None);
         assert!(result.contains("bold text"));
         assert!(!result.contains("\\bf"));
     }
 
     #[test]
     fn test_pre_diacritic_noop() {
-        let result = strip_pre_diacritic_commands(r"\relax\par some text");
+        let result = strip_pre_diacritic_commands(r"\relax\par some text", None);
         assert!(result.contains("some text"));
         assert!(!result.contains("relax"));
         assert!(!result.contains("\\par"));
@@ -841,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_pre_diacritic_pagestyle() {
-        let result = strip_pre_diacritic_commands(r"\pagestyle{plain} text");
+        let result = strip_pre_diacritic_commands(r"\pagestyle{plain} text", None);
         assert!(result.contains("text"));
         assert!(!result.contains("pagestyle"));
         assert!(!result.contains("plain"));
@@ -849,28 +857,28 @@ mod tests {
 
     #[test]
     fn test_pre_diacritic_setcounter() {
-        let result = strip_pre_diacritic_commands(r"\setcounter{page}{1} text");
+        let result = strip_pre_diacritic_commands(r"\setcounter{page}{1} text", None);
         assert!(result.contains("text"));
         assert!(!result.contains("setcounter"));
     }
 
     #[test]
     fn test_pre_diacritic_kern() {
-        let result = strip_pre_diacritic_commands(r"\kern 3pt text");
+        let result = strip_pre_diacritic_commands(r"\kern 3pt text", None);
         assert!(result.contains("text"));
         assert!(!result.contains("kern"));
     }
 
     #[test]
     fn test_pre_diacritic_penalty() {
-        let result = strip_pre_diacritic_commands(r"\penalty 10000 text");
+        let result = strip_pre_diacritic_commands(r"\penalty 10000 text", None);
         assert!(result.contains("text"));
         assert!(!result.contains("penalty"));
     }
 
     #[test]
     fn test_addcontentsline_stripped() {
-        let result = strip_pre_diacritic_commands(r"\addcontentsline{toc}{section}{Intro} text");
+        let result = strip_pre_diacritic_commands(r"\addcontentsline{toc}{section}{Intro} text", None);
         assert!(result.contains("text"));
         assert!(!result.contains("addcontentsline"));
         assert!(!result.contains("toc"));
@@ -930,21 +938,21 @@ mod tests {
 
     #[test]
     fn test_geometry_stripped() {
-        let result = strip_pre_diacritic_commands(r"\geometry{margin=1in} text");
+        let result = strip_pre_diacritic_commands(r"\geometry{margin=1in} text", None);
         assert!(result.contains("text"));
         assert!(!result.contains("geometry"));
     }
 
     #[test]
     fn test_tikzset_stripped() {
-        let result = strip_pre_diacritic_commands(r"\tikzset{foo=bar} text");
+        let result = strip_pre_diacritic_commands(r"\tikzset{foo=bar} text", None);
         assert!(result.contains("text"));
         assert!(!result.contains("tikzset"));
     }
 
     #[test]
     fn test_index_stripped() {
-        let result = strip_pre_diacritic_commands(r"text\index{keyword} more");
+        let result = strip_pre_diacritic_commands(r"text\index{keyword} more", None);
         assert!(result.contains("text"));
         assert!(result.contains("more"));
         assert!(!result.contains("keyword"), "index should be stripped: {result}");
@@ -952,7 +960,7 @@ mod tests {
 
     #[test]
     fn test_makeindex_stripped() {
-        let result = strip_pre_diacritic_commands(r"\makeindex some text");
+        let result = strip_pre_diacritic_commands(r"\makeindex some text", None);
         assert!(result.contains("some text"));
         assert!(!result.contains("makeindex"));
     }

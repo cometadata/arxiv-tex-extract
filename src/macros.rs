@@ -5,6 +5,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::time::Instant;
+use tracing::trace;
 
 static PROTECTED_MACROS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
@@ -344,29 +345,62 @@ pub fn expand_parametric_macros(text: &str, macros: &[ParametricMacro], deadline
 
     let max_passes = if text.len() > LARGE_INPUT_THRESHOLD { 2 } else { 3 };
     let mut result = text.to_string();
+    trace!(num_macros = macros.len(), text_len = text.len(), max_passes, "expand_parametric starting");
 
-    for _ in 0..max_passes {
-        if deadline_expired(deadline) { break; }
-        let prev = result.clone();
-        for mac in macros {
-            result = expand_single_parametric(&result, mac);
-        }
-        if result == prev {
+    for pass in 0..max_passes {
+        if deadline_expired(deadline) {
+            trace!(pass, "expand_parametric deadline expired before pass");
             break;
         }
+        let prev_len = result.len();
+        let prev = result.clone();
+        for (i, mac) in macros.iter().enumerate() {
+            if deadline_expired(deadline) {
+                trace!(pass, macro_index = i, name = %mac.name, "expand_parametric deadline expired during pass");
+                break;
+            }
+            let before_len = result.len();
+            trace!(pass, macro_index = i, name = %mac.name, num_args = mac.num_args, text_len = before_len, "starting macro expansion");
+            result = expand_single_parametric(&result, mac, deadline);
+            if result.len() != before_len {
+                trace!(pass, macro_index = i, name = %mac.name, before_len, after_len = result.len(), "macro changed text size");
+            }
+        }
+        if result == prev {
+            trace!(pass, "expand_parametric pass produced no changes, stopping");
+            break;
+        }
+        trace!(pass, prev_len, new_len = result.len(), "expand_parametric pass complete");
     }
 
+    trace!(final_len = result.len(), "expand_parametric finished");
     result
 }
 
 /// Expand all occurrences of a single parametric macro in the text.
-fn expand_single_parametric(text: &str, mac: &ParametricMacro) -> String {
+fn expand_single_parametric(text: &str, mac: &ParametricMacro, deadline: Option<Instant>) -> String {
     let name = &mac.name;
     let name_len = name.len();
     let mut out = String::with_capacity(text.len());
     let mut search_from = 0;
+    let mut iter_count: u32 = 0;
+    let mut expanded_count: u32 = 0;
+    let mut skipped_boundary: u32 = 0;
+    let mut failed_extract: u32 = 0;
 
     while let Some(rel_pos) = text[search_from..].find(name.as_str()) {
+        if deadline_expired(deadline) {
+            trace!(name = %name, iter_count, expanded_count, skipped_boundary, failed_extract,
+                   out_len = out.len(), "expand_single_parametric deadline expired");
+            out.push_str(&text[search_from..]);
+            return out;
+        }
+        iter_count += 1;
+        if iter_count % 1000 == 0 {
+            trace!(name = %name, iter_count, search_from,
+                   out_len = out.len(), remaining = text.len() - search_from,
+                   "expand_single_parametric progress");
+        }
         let abs_pos = search_from + rel_pos;
         let after_name = abs_pos + name_len;
 
@@ -374,23 +408,32 @@ fn expand_single_parametric(text: &str, mac: &ParametricMacro) -> String {
         if after_name < text.len() && text.as_bytes()[after_name].is_ascii_alphabetic() {
             out.push_str(&text[search_from..after_name]);
             search_from = after_name;
+            skipped_boundary += 1;
             continue;
         }
+
+        trace!(name = %name, iter_count, abs_pos, after_name, "before try_expand");
 
         // Copy text before the match
         out.push_str(&text[search_from..abs_pos]);
 
         if let Some((replacement, new_cursor)) = try_expand_parametric(text, after_name, mac) {
+            trace!(name = %name, iter_count, new_cursor, repl_len = replacement.len(), "expanded ok");
             out.push_str(&replacement);
             search_from = new_cursor;
+            expanded_count += 1;
         } else {
+            trace!(name = %name, iter_count, "extract failed");
             // Could not extract required arguments; keep the command as-is
             out.push_str(name);
             search_from = after_name;
+            failed_extract += 1;
         }
     }
 
     out.push_str(&text[search_from..]);
+    trace!(name = %name, iter_count, expanded_count, skipped_boundary, failed_extract,
+           out_len = out.len(), "expand_single_parametric done");
     out
 }
 
@@ -406,6 +449,10 @@ fn try_expand_parametric(
     let mut cursor = start;
     let mut arg_values: Vec<String> = Vec::with_capacity(mac.num_args);
 
+    trace!(name = %mac.name, start, num_args = mac.num_args,
+           has_optional = mac.optional_default.is_some(),
+           body_len = mac.body.len(), "try_expand_parametric enter");
+
     if let Some(ref default) = mac.optional_default {
         // First arg is optional with a default value
         if let Some((cs, ce, after)) = extract_optional_arg(text, cursor) {
@@ -414,22 +461,28 @@ fn try_expand_parametric(
         } else {
             arg_values.push(default.clone());
         }
+        trace!(name = %mac.name, cursor, "optional arg done");
         // Remaining args are mandatory
-        for _ in 0..mac.num_args - 1 {
+        for i in 0..mac.num_args - 1 {
             let (cs, ce, after) = extract_command_arg(text, cursor)?;
+            trace!(name = %mac.name, arg = i + 1, cs, ce, after, "extracted mandatory arg");
             arg_values.push(text[cs..ce].to_string());
             cursor = after;
         }
     } else {
         // All args are mandatory
-        for _ in 0..mac.num_args {
+        for i in 0..mac.num_args {
+            trace!(name = %mac.name, arg = i, cursor, "extracting arg");
             let (cs, ce, after) = extract_command_arg(text, cursor)?;
+            trace!(name = %mac.name, arg = i, cs, ce, after, arg_len = ce - cs, "extracted arg");
             arg_values.push(text[cs..ce].to_string());
             cursor = after;
         }
     }
 
+    trace!(name = %mac.name, cursor, body = %mac.body, "args done, calling substitute_args");
     let replacement = substitute_args(&mac.body, &arg_values);
+    trace!(name = %mac.name, repl_len = replacement.len(), "substitute_args done");
     Some((replacement, cursor))
 }
 
@@ -442,8 +495,12 @@ fn substitute_args(body: &str, args: &[String]) -> String {
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'#' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'#' {
+        if bytes[i] == b'#' {
+            if i + 1 >= bytes.len() {
+                // Trailing '#' with nothing after it — emit as literal
+                out.push('#');
+                i += 1;
+            } else if bytes[i + 1] == b'#' {
                 out.push('#');
                 i += 2;
             } else if bytes[i + 1].is_ascii_digit() {

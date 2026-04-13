@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use latex_extract::archive::{self, PaperArchive};
 use latex_extract::checkpoint;
@@ -672,7 +672,21 @@ fn process_outer_tar(
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
                     Ok(paper) => {
+                        let total_bytes: usize = paper.tex_files.iter().map(|f| f.content.len()).sum();
+                        debug!(
+                            arxiv_id = %paper.arxiv_id,
+                            num_files = paper.tex_files.len(),
+                            total_bytes,
+                            tar = %stem,
+                            "processing paper"
+                        );
                         let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
+                        debug!(
+                            arxiv_id = %result.arxiv_id,
+                            status = %result.status,
+                            tar = %stem,
+                            "finished paper"
+                        );
                         counts.record(classify_result(&result), &result.arxiv_id);
                         if let Err(e) = writer.write(result) {
                             error!(category = "io", tar = %stem, "parquet write error: {}", e);
@@ -699,7 +713,21 @@ fn process_outer_tar(
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
                     Ok(paper) => {
+                        let total_bytes: usize = paper.tex_files.iter().map(|f| f.content.len()).sum();
+                        debug!(
+                            arxiv_id = %paper.arxiv_id,
+                            num_files = paper.tex_files.len(),
+                            total_bytes,
+                            tar = %stem,
+                            "processing paper"
+                        );
                         let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
+                        debug!(
+                            arxiv_id = %result.arxiv_id,
+                            status = %result.status,
+                            tar = %stem,
+                            "finished paper"
+                        );
                         counts.record(classify_result(&result), &result.arxiv_id);
                         if let Err(e) = serde_json::to_writer(&mut writer, &result) {
                             error!(category = "io", tar = %stem, "JSON write error: {}", e);
@@ -828,10 +856,11 @@ fn extract_with_timeout(
     let deadline_at = Instant::now() + timeout;
     let result = process_paper(paper, source_tar, Some(deadline_at));
 
-    // The pipeline bails between stages when the deadline passes, but a
-    // slow final stage can push past it. This post-call check also
-    // distinguishes a genuinely empty document from a cooperative timeout.
-    if Instant::now() >= deadline_at {
+    // If the pipeline bailed out cooperatively (text is None) and the
+    // deadline has passed, report it as a timeout rather than an empty
+    // document.  When text was produced successfully we keep it, even if
+    // the deadline was exceeded — discarding valid work would be wasteful.
+    if result.text.is_none() && Instant::now() >= deadline_at {
         error!(
             category = "timeout",
             arxiv_id = %paper.arxiv_id,
