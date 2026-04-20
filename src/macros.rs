@@ -438,8 +438,12 @@ fn substitute_args(body: &str, args: &[String]) -> String {
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'#' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'#' {
+        if bytes[i] == b'#' {
+            if i + 1 >= bytes.len() {
+                // Trailing '#' with nothing after it — emit as literal
+                out.push('#');
+                i += 1;
+            } else if bytes[i + 1] == b'#' {
                 out.push('#');
                 i += 2;
             } else if bytes[i + 1].is_ascii_digit() {
