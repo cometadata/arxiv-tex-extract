@@ -69,12 +69,12 @@ fn classify_gz(raw: &[u8], arxiv_id: &str) -> (Vec<TexFile>, FileType) {
 /// Unlike `iter_papers()`, this keeps only one `PaperArchive` in memory
 /// at a time. Each paper is fully processed (via the callback `f`) before
 /// the next entry is read from the tar archive.
-pub fn for_each_paper(reader: impl Read, mut f: impl FnMut(Result<PaperArchive>)) {
+pub fn for_each_paper(reader: impl Read, mut f: impl FnMut(String, Result<PaperArchive>)) {
     let mut archive = tar::Archive::new(reader);
     let entries = match archive.entries() {
         Ok(e) => e,
         Err(e) => {
-            f(Err(anyhow::anyhow!("failed to read tar entries: {}", e)));
+            f("unknown".into(), Err(anyhow::anyhow!("failed to read tar entries: {}", e)));
             return;
         }
     };
@@ -83,7 +83,7 @@ pub fn for_each_paper(reader: impl Read, mut f: impl FnMut(Result<PaperArchive>)
         let entry = match entry_result {
             Ok(e) => e,
             Err(e) => {
-                f(Err(anyhow::anyhow!("tar entry error: {}", e)));
+                f("unknown".into(), Err(anyhow::anyhow!("tar entry error: {}", e)));
                 continue;
             }
         };
@@ -100,7 +100,7 @@ pub fn for_each_paper(reader: impl Read, mut f: impl FnMut(Result<PaperArchive>)
         }
 
         let arxiv_id = derive_arxiv_id(&path);
-        f(process_entry(entry, &arxiv_id, &path));
+        f(arxiv_id.clone(), process_entry(entry, &arxiv_id, &path));
     }
 }
 
@@ -110,7 +110,7 @@ pub fn for_each_paper(reader: impl Read, mut f: impl FnMut(Result<PaperArchive>)
 /// all results is acceptable (testing, small archives).
 pub fn iter_papers(reader: impl Read) -> Vec<Result<PaperArchive>> {
     let mut results = Vec::new();
-    for_each_paper(reader, |result| results.push(result));
+    for_each_paper(reader, |_arxiv_id, result| results.push(result));
     results
 }
 

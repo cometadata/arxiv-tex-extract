@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use latex_extract::archive::{self, PaperArchive};
 use latex_extract::checkpoint;
@@ -745,10 +745,11 @@ fn process_outer_tar_text(
         .to_string_lossy()
         .to_string();
 
+    debug!(tar = %source_tar, "processing tar");
     let file = File::open(tar_path)?;
     let mut counts = StatusCounts::default();
 
-    archive::for_each_paper(file, |paper_result| {
+    archive::for_each_paper(file, |arxiv_id, paper_result| {
         match paper_result {
             Ok(paper) => {
                 let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
@@ -764,8 +765,8 @@ fn process_outer_tar_text(
                 counts.record(outcome, &result.arxiv_id);
             }
             Err(e) => {
-                error!(category = "archive", tar = %stem, "entry error: {}", e);
-                counts.record(Outcome::ArchiveError, "unknown");
+                error!(category = "archive", tar = %stem, arxiv_id = %arxiv_id, "entry error: {}", e);
+                counts.record(Outcome::ArchiveError, &arxiv_id);
             }
         }
     });
@@ -797,6 +798,7 @@ fn process_outer_tar(
         .to_string();
 
     let start = std::time::Instant::now();
+    debug!(tar = %source_tar, "processing tar");
     let file = File::open(tar_path)?;
 
     let mut counts = StatusCounts::default();
@@ -806,11 +808,11 @@ fn process_outer_tar(
             let mut writer =
                 ParquetShardWriter::new(output_dir, &stem, max_shard_rows, max_shard_bytes);
 
-            archive::for_each_paper(file, |paper_result| {
+            archive::for_each_paper(file, |arxiv_id, paper_result| {
                 match paper_result {
                     Ok(paper) => {
                         let total_bytes: usize = paper.tex_files.iter().map(|f| f.content.len()).sum();
-                        debug!(
+                        trace!(
                             arxiv_id = %paper.arxiv_id,
                             num_files = paper.tex_files.len(),
                             total_bytes,
@@ -818,7 +820,7 @@ fn process_outer_tar(
                             "processing paper"
                         );
                         let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
-                        debug!(
+                        trace!(
                             arxiv_id = %result.arxiv_id,
                             status = %result.status,
                             tar = %stem,
@@ -831,8 +833,17 @@ fn process_outer_tar(
                         }
                     }
                     Err(e) => {
-                        error!(category = "archive", tar = %stem, "entry error: {}", e);
-                        counts.record(Outcome::ArchiveError, "unknown");
+                        error!(category = "archive", tar = %stem, arxiv_id = %arxiv_id, "entry error: {}", e);
+                        counts.record(Outcome::ArchiveError, &arxiv_id);
+                        let result = ExtractionResult::error(
+                            arxiv_id,
+                            Some(source_tar.clone()),
+                            "archive_error",
+                            format!("{}", e),
+                        );
+                        if let Err(e) = writer.write(result) {
+                            error!(category = "io", tar = %stem, "parquet write error: {}", e);
+                        }
                     }
                 }
             });
@@ -847,11 +858,11 @@ fn process_outer_tar(
             let output_file = File::create(&temp_path)?;
             let mut writer = BufWriter::new(output_file);
 
-            archive::for_each_paper(file, |paper_result| {
+            archive::for_each_paper(file, |arxiv_id, paper_result| {
                 match paper_result {
                     Ok(paper) => {
                         let total_bytes: usize = paper.tex_files.iter().map(|f| f.content.len()).sum();
-                        debug!(
+                        trace!(
                             arxiv_id = %paper.arxiv_id,
                             num_files = paper.tex_files.len(),
                             total_bytes,
@@ -859,7 +870,7 @@ fn process_outer_tar(
                             "processing paper"
                         );
                         let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
-                        debug!(
+                        trace!(
                             arxiv_id = %result.arxiv_id,
                             status = %result.status,
                             tar = %stem,
@@ -873,8 +884,18 @@ fn process_outer_tar(
                         let _ = writer.write_all(b"\n");
                     }
                     Err(e) => {
-                        error!(category = "archive", tar = %stem, "entry error: {}", e);
-                        counts.record(Outcome::ArchiveError, "unknown");
+                        error!(category = "archive", tar = %stem, arxiv_id = %arxiv_id, "entry error: {}", e);
+                        counts.record(Outcome::ArchiveError, &arxiv_id);
+                        let result = ExtractionResult::error(
+                            arxiv_id,
+                            Some(source_tar.clone()),
+                            "archive_error",
+                            format!("{}", e),
+                        );
+                        if let Err(e) = serde_json::to_writer(&mut writer, &result) {
+                            error!(category = "io", tar = %stem, "JSON write error: {}", e);
+                        }
+                        let _ = writer.write_all(b"\n");
                     }
                 }
             });

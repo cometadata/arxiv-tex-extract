@@ -345,35 +345,35 @@ pub fn expand_parametric_macros(text: &str, macros: &[ParametricMacro], deadline
 
     let max_passes = if text.len() > LARGE_INPUT_THRESHOLD { 2 } else { 3 };
     let mut result = text.to_string();
-    trace!(num_macros = macros.len(), text_len = text.len(), max_passes, "expand_parametric starting");
+    trace!(target: "macro_expansion", num_macros = macros.len(), text_len = text.len(), max_passes, "expand_parametric starting");
 
     for pass in 0..max_passes {
         if deadline_expired(deadline) {
-            trace!(pass, "expand_parametric deadline expired before pass");
+            trace!(target: "macro_expansion", pass, "expand_parametric deadline expired before pass");
             break;
         }
         let prev_len = result.len();
         let prev = result.clone();
         for (i, mac) in macros.iter().enumerate() {
             if deadline_expired(deadline) {
-                trace!(pass, macro_index = i, name = %mac.name, "expand_parametric deadline expired during pass");
+                trace!(target: "macro_expansion", pass, macro_index = i, name = %mac.name, "expand_parametric deadline expired during pass");
                 break;
             }
             let before_len = result.len();
-            trace!(pass, macro_index = i, name = %mac.name, num_args = mac.num_args, text_len = before_len, "starting macro expansion");
+            trace!(target: "macro_expansion", pass, macro_index = i, name = %mac.name, num_args = mac.num_args, text_len = before_len, "starting macro expansion");
             result = expand_single_parametric(&result, mac, deadline);
             if result.len() != before_len {
-                trace!(pass, macro_index = i, name = %mac.name, before_len, after_len = result.len(), "macro changed text size");
+                trace!(target: "macro_expansion", pass, macro_index = i, name = %mac.name, before_len, after_len = result.len(), "macro changed text size");
             }
         }
         if result == prev {
-            trace!(pass, "expand_parametric pass produced no changes, stopping");
+            trace!(target: "macro_expansion", pass, "expand_parametric pass produced no changes, stopping");
             break;
         }
-        trace!(pass, prev_len, new_len = result.len(), "expand_parametric pass complete");
+        trace!(target: "macro_expansion", pass, prev_len, new_len = result.len(), "expand_parametric pass complete");
     }
 
-    trace!(final_len = result.len(), "expand_parametric finished");
+    trace!(target: "macro_expansion", final_len = result.len(), "expand_parametric finished");
     result
 }
 
@@ -390,14 +390,14 @@ fn expand_single_parametric(text: &str, mac: &ParametricMacro, deadline: Option<
 
     while let Some(rel_pos) = text[search_from..].find(name.as_str()) {
         if deadline_expired(deadline) {
-            trace!(name = %name, iter_count, expanded_count, skipped_boundary, failed_extract,
+            trace!(target: "macro_expansion", name = %name, iter_count, expanded_count, skipped_boundary, failed_extract,
                    out_len = out.len(), "expand_single_parametric deadline expired");
             out.push_str(&text[search_from..]);
             return out;
         }
         iter_count += 1;
         if iter_count % 1000 == 0 {
-            trace!(name = %name, iter_count, search_from,
+            trace!(target: "macro_expansion", name = %name, iter_count, search_from,
                    out_len = out.len(), remaining = text.len() - search_from,
                    "expand_single_parametric progress");
         }
@@ -412,18 +412,18 @@ fn expand_single_parametric(text: &str, mac: &ParametricMacro, deadline: Option<
             continue;
         }
 
-        trace!(name = %name, iter_count, abs_pos, after_name, "before try_expand");
+        trace!(target: "macro_expansion", name = %name, iter_count, abs_pos, after_name, "before try_expand");
 
         // Copy text before the match
         out.push_str(&text[search_from..abs_pos]);
 
         if let Some((replacement, new_cursor)) = try_expand_parametric(text, after_name, mac) {
-            trace!(name = %name, iter_count, new_cursor, repl_len = replacement.len(), "expanded ok");
+            trace!(target: "macro_expansion", name = %name, iter_count, new_cursor, repl_len = replacement.len(), "expanded ok");
             out.push_str(&replacement);
             search_from = new_cursor;
             expanded_count += 1;
         } else {
-            trace!(name = %name, iter_count, "extract failed");
+            trace!(target: "macro_expansion", name = %name, iter_count, "extract failed");
             // Could not extract required arguments; keep the command as-is
             out.push_str(name);
             search_from = after_name;
@@ -432,7 +432,7 @@ fn expand_single_parametric(text: &str, mac: &ParametricMacro, deadline: Option<
     }
 
     out.push_str(&text[search_from..]);
-    trace!(name = %name, iter_count, expanded_count, skipped_boundary, failed_extract,
+    trace!(target: "macro_expansion", name = %name, iter_count, expanded_count, skipped_boundary, failed_extract,
            out_len = out.len(), "expand_single_parametric done");
     out
 }
@@ -449,7 +449,7 @@ fn try_expand_parametric(
     let mut cursor = start;
     let mut arg_values: Vec<String> = Vec::with_capacity(mac.num_args);
 
-    trace!(name = %mac.name, start, num_args = mac.num_args,
+    trace!(target: "macro_expansion", name = %mac.name, start, num_args = mac.num_args,
            has_optional = mac.optional_default.is_some(),
            body_len = mac.body.len(), "try_expand_parametric enter");
 
@@ -461,28 +461,28 @@ fn try_expand_parametric(
         } else {
             arg_values.push(default.clone());
         }
-        trace!(name = %mac.name, cursor, "optional arg done");
+        trace!(target: "macro_expansion", name = %mac.name, cursor, "optional arg done");
         // Remaining args are mandatory
         for i in 0..mac.num_args - 1 {
             let (cs, ce, after) = extract_command_arg(text, cursor)?;
-            trace!(name = %mac.name, arg = i + 1, cs, ce, after, "extracted mandatory arg");
+            trace!(target: "macro_expansion", name = %mac.name, arg = i + 1, cs, ce, after, "extracted mandatory arg");
             arg_values.push(text[cs..ce].to_string());
             cursor = after;
         }
     } else {
         // All args are mandatory
         for i in 0..mac.num_args {
-            trace!(name = %mac.name, arg = i, cursor, "extracting arg");
+            trace!(target: "macro_expansion", name = %mac.name, arg = i, cursor, "extracting arg");
             let (cs, ce, after) = extract_command_arg(text, cursor)?;
-            trace!(name = %mac.name, arg = i, cs, ce, after, arg_len = ce - cs, "extracted arg");
+            trace!(target: "macro_expansion", name = %mac.name, arg = i, cs, ce, after, arg_len = ce - cs, "extracted arg");
             arg_values.push(text[cs..ce].to_string());
             cursor = after;
         }
     }
 
-    trace!(name = %mac.name, cursor, body = %mac.body, "args done, calling substitute_args");
+    trace!(target: "macro_expansion", name = %mac.name, cursor, body = %mac.body, "args done, calling substitute_args");
     let replacement = substitute_args(&mac.body, &arg_values);
-    trace!(name = %mac.name, repl_len = replacement.len(), "substitute_args done");
+    trace!(target: "macro_expansion", name = %mac.name, repl_len = replacement.len(), "substitute_args done");
     Some((replacement, cursor))
 }
 
