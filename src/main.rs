@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use latex_extract::archive::{self, PaperArchive};
 use latex_extract::checkpoint;
@@ -608,6 +608,7 @@ fn process_outer_tar_text(
         .to_string_lossy()
         .to_string();
 
+    debug!(tar = %source_tar, "processing tar");
     let file = File::open(tar_path)?;
     let mut counts = StatusCounts::default();
 
@@ -660,6 +661,7 @@ fn process_outer_tar(
         .to_string();
 
     let start = std::time::Instant::now();
+    debug!(tar = %source_tar, "processing tar");
     let file = File::open(tar_path)?;
 
     let mut counts = StatusCounts::default();
@@ -672,7 +674,21 @@ fn process_outer_tar(
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
                     Ok(paper) => {
+                        let total_bytes: usize = paper.tex_files.iter().map(|f| f.content.len()).sum();
+                        trace!(
+                            arxiv_id = %paper.arxiv_id,
+                            num_files = paper.tex_files.len(),
+                            total_bytes,
+                            tar = %stem,
+                            "processing paper"
+                        );
                         let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
+                        trace!(
+                            arxiv_id = %result.arxiv_id,
+                            status = %result.status,
+                            tar = %stem,
+                            "processed paper"
+                        );
                         counts.record(classify_result(&result), &result.arxiv_id);
                         if let Err(e) = writer.write(result) {
                             error!(category = "io", tar = %stem, "parquet write error: {}", e);
@@ -699,7 +715,21 @@ fn process_outer_tar(
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
                     Ok(paper) => {
+                        let total_bytes: usize = paper.tex_files.iter().map(|f| f.content.len()).sum();
+                        trace!(
+                            arxiv_id = %paper.arxiv_id,
+                            num_files = paper.tex_files.len(),
+                            total_bytes,
+                            tar = %stem,
+                            "processing paper"
+                        );
                         let result = extract_with_timeout(&paper, Some(&source_tar), timeout, max_tex_bytes, max_memory_bytes);
+                        trace!(
+                            arxiv_id = %result.arxiv_id,
+                            status = %result.status,
+                            tar = %stem,
+                            "processed paper"
+                        );
                         counts.record(classify_result(&result), &result.arxiv_id);
                         if let Err(e) = serde_json::to_writer(&mut writer, &result) {
                             error!(category = "io", tar = %stem, "JSON write error: {}", e);
