@@ -813,6 +813,13 @@ mod tests {
     }
 
     #[test]
+    fn test_substitute_args_trailing_hash() {
+        // Trailing '#' with nothing after it must not cause infinite loop
+        let result = substitute_args("text#", &["arg1".to_string()]);
+        assert_eq!(result, "text#");
+    }
+
+    #[test]
     fn test_normalize_shorthands_be() {
         assert_eq!(normalize_shorthands("\\be x \\ee"), "\\begin{equation} x \\end{equation}");
     }

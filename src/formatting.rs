@@ -1117,6 +1117,14 @@ mod tests {
     }
 
     #[test]
+    fn test_lstinline_multibyte_delimiter() {
+        // Multi-byte UTF-8 char as lstinline delimiter must not panic
+        let input = "before \\lstinline·code· after";
+        let result = convert_formatting(input);
+        assert_eq!(result, "before code after");
+    }
+
+    #[test]
     fn test_mintinline() {
         let result = convert_formatting(r"\mintinline{python}{x = 1}");
         assert_eq!(result, "x = 1");
