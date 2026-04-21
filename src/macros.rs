@@ -438,8 +438,12 @@ fn substitute_args(body: &str, args: &[String]) -> String {
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'#' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'#' {
+        if bytes[i] == b'#' {
+            if i + 1 >= bytes.len() {
+                // Trailing '#' with nothing after it — emit as literal
+                out.push('#');
+                i += 1;
+            } else if bytes[i + 1] == b'#' {
                 out.push('#');
                 i += 2;
             } else if bytes[i + 1].is_ascii_digit() {
@@ -806,6 +810,13 @@ mod tests {
         let args = vec!["#2".to_string(), "real2".to_string()];
         let result = substitute_args("#1 and #2", &args);
         assert_eq!(result, "#2 and real2");
+    }
+
+    #[test]
+    fn test_substitute_args_trailing_hash() {
+        // Trailing '#' with nothing after it must not cause infinite loop
+        let result = substitute_args("text#", &["arg1".to_string()]);
+        assert_eq!(result, "text#");
     }
 
     #[test]

@@ -93,20 +93,19 @@ fn convert_inline_verb(text: &str) -> String {
             continue;
         }
 
-        // Next character is the delimiter
-        if after >= bytes.len() {
+        // Next character is the delimiter (may be multi-byte UTF-8)
+        let Some(delim_char) = text[after..].chars().next() else {
             search_start = after;
             continue;
-        }
-        let delim = bytes[after];
-        let content_start = after + 1;
+        };
+        let content_start = after + delim_char.len_utf8();
 
         // Find matching delimiter
-        if let Some(end_offset) = text[content_start..].find(delim as char) {
+        if let Some(end_offset) = text[content_start..].find(delim_char) {
             let content_end = content_start + end_offset;
             result.push_str(&text[last_end..abs_pos]);
             result.push_str(&text[content_start..content_end]);
-            last_end = content_end + 1;
+            last_end = content_end + delim_char.len_utf8();
             search_start = last_end;
         } else {
             search_start = content_start;
@@ -154,14 +153,13 @@ fn convert_lstinline(text: &str) -> String {
         let after_opt = skip_optional_arg(text, after);
 
         // Delimiter form: \lstinline|...|
-        if after_opt < bytes.len() && bytes[after_opt] != b'{' {
-            let delim = bytes[after_opt];
-            let content_start = after_opt + 1;
-            if let Some(end_offset) = text[content_start..].find(delim as char) {
+        if let Some(delim_char) = text[after_opt..].chars().next().filter(|&c| c != '{') {
+            let content_start = after_opt + delim_char.len_utf8();
+            if let Some(end_offset) = text[content_start..].find(delim_char) {
                 let content_end = content_start + end_offset;
                 result.push_str(&text[last_end..abs_pos]);
                 result.push_str(&text[content_start..content_end]);
-                last_end = content_end + 1;
+                last_end = content_end + delim_char.len_utf8();
                 search_start = last_end;
                 continue;
             }
@@ -1099,6 +1097,14 @@ mod tests {
     }
 
     #[test]
+    fn test_verb_multibyte_delimiter() {
+        // Multi-byte UTF-8 char adjacent to \verb must not panic
+        let input = "before \\verb·code· after";
+        let result = convert_formatting(input);
+        assert_eq!(result, "before code after");
+    }
+
+    #[test]
     fn test_lstinline_braced() {
         let result = convert_formatting(r"\lstinline{x = 1}");
         assert_eq!(result, "x = 1");
@@ -1108,6 +1114,14 @@ mod tests {
     fn test_lstinline_delimiter() {
         let result = convert_formatting(r"\lstinline|x = 1|");
         assert_eq!(result, "x = 1");
+    }
+
+    #[test]
+    fn test_lstinline_multibyte_delimiter() {
+        // Multi-byte UTF-8 char as lstinline delimiter must not panic
+        let input = "before \\lstinline·code· after";
+        let result = convert_formatting(input);
+        assert_eq!(result, "before code after");
     }
 
     #[test]
