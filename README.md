@@ -65,9 +65,14 @@ latex-extract \
   --output-format parquet \
   --max-shard-rows 5000 \
   --max-shard-bytes 128000000 \
+  --papers-per-shard 256 \
   --resume \
   --metrics
 ```
+
+`--papers-per-shard 256` bounds the blast radius of a process-wide SIGKILL
+(macOS jetsam / Linux OOM) to the most recent shard rather than the whole
+tar. See [Jetsam / OOM resilience](#jetsam--oom-resilience) below.
 
 ## CLI Reference
 
@@ -83,7 +88,8 @@ latex-extract \
 | `--output-format <FMT>` | `parquet` or `jsonl` | `parquet` |
 | `--max-shard-rows <N>` | Max rows per Parquet shard | `10000` |
 | `--max-shard-bytes <N>` | Max uncompressed bytes per Parquet shard | `256000000` (256 MB) |
-| `--resume` | Skip already-processed tars using `checkpoint.log` | off |
+| `--papers-per-shard <N>` | Rotate to a new shard every N papers; activates per-paper checkpointing for jetsam-resilient `--resume` | unset |
+| `--resume` | Skip work already recorded in `checkpoint.log` (tar-level always; per-paper when `--papers-per-shard` is set) | off |
 | `--metrics` | Emit `{stem}_metrics.json` sidecar per tar | off |
 
 Either `--input-dir` or `--input-file` must be provided. Batch mode (`--input-dir`) requires `--output-dir`.
@@ -107,7 +113,18 @@ Each extracted paper produces one record with these fields:
 
 ### Parquet sharding
 
-Parquet output is automatically split into shards when either the row count or byte estimate exceeds the configured limits. Shard files are named `{stem}.parquet`, `{stem}_001.parquet`, `{stem}_002.parquet`, etc. All shards use zstd compression (level 3) and are written atomically via temp-file-then-rename.
+Parquet output is automatically split into shards when any of the configured
+limits is reached: `--max-shard-rows`, `--max-shard-bytes`, or
+`--papers-per-shard` (first-fired wins). Shard files are named
+`{stem}.parquet`, `{stem}_001.parquet`, `{stem}_002.parquet`, etc. All
+shards use zstd compression (level 3) and are written atomically via
+temp-file-then-rename. On `--resume`, the writer scans existing shards
+for a tar's stem and starts new shards after the highest found index so
+prior-run output is never overwritten.
+
+JSONL output follows the same rotation rules and filename convention
+(`{stem}.jsonl`, `{stem}_001.jsonl`, …) when `--papers-per-shard` is set;
+without the flag, JSONL writes a single file per tar as before.
 
 ### Error categorization
 
@@ -118,6 +135,7 @@ Extraction outcomes are classified into fine-grained categories rather than a si
 | `ok` | Successful extraction |
 | `empty` | No `.tex` files found, or extraction produced no text |
 | `skipped` | Combined `.tex` content exceeds size limit (default 20 MB) |
+| `skipped_resume` | Paper was already recorded as durable by a prior run — extraction bypassed |
 | `timeout` | Per-document extraction timeout fired |
 | `panic` | Extraction pipeline panicked (caught by `catch_unwind`) |
 | `crash` | Extraction thread disconnected unexpectedly |
@@ -140,6 +158,7 @@ The summary log shows a breakdown with sample IDs for non-zero categories:
 Done: 50 tars, 125000 papers (123500 ok)
   200 timeouts (e.g. 2401.00100, 2401.00200, 2401.00300, 2401.00400, 2401.00500)
   400 skipped (e.g. 2401.10000, 2401.10001)
+  2300 skipped (resume) (e.g. 2401.20000, 2401.20001)
   150 panics (e.g. 2401.00001, 2401.00523, 2401.01234)
   130 archive errors (e.g. hep-ph/0001001, hep-ph/0001002)
   100 empty
@@ -158,6 +177,7 @@ When `--metrics` is enabled, each processed tar produces a JSON file like:
   "ok": 4850,
   "empty": 60,
   "skipped": 40,
+  "skipped_resume": 0,
   "timeouts": 20,
   "panics": 15,
   "crashes": 2,
@@ -199,9 +219,67 @@ Documents exceeding the `.tex` size limit are reported with status `skipped`. Ti
 
 ## Checkpoint and Resume
 
-In batch mode, each successfully processed tar file is appended to `checkpoint.log` in the output directory (fsync'd after each write). When `--resume` is passed, any tar listed in the checkpoint is skipped.
+Batch mode writes `checkpoint.log` in the output directory (fsync'd after each
+write). It carries two kinds of entries, parsed by field count so both coexist:
 
-This makes it safe to interrupt and restart long-running jobs — only unprocessed tars will be reprocessed.
+- `tar_name` (one field) — the whole tar completed successfully.
+- `tar_name\tarxiv_id` (two fields, tab-separated) — that specific paper
+  is already in a readable shard on disk. Only emitted when
+  `--papers-per-shard` is set.
+
+`--resume` uses both: it skips whole tars found in the first form, and inside
+remaining tars it skips papers found in the second form (classified as
+`skipped_resume`) before any extraction work runs. Stale `.tmp` shards from
+a prior-run kill are deleted at tar start — by invariant (below) they
+only hold non-checkpointed rows, so discarding them is safe.
+
+## Jetsam / OOM resilience
+
+Long batch runs on large corpora can hit process-wide SIGKILL from macOS
+jetsam or the Linux OOM-killer. Without `--papers-per-shard`, a kill in the
+middle of a tar loses every paper in the in-flight tar's output (Parquet
+files only become readable once the footer is written at shard close).
+
+With `--papers-per-shard N`, two things change:
+
+1. **Shard rotation.** The writer closes and renames a shard every N papers
+   (in addition to the existing `--max-shard-rows` / `--max-shard-bytes`
+   triggers). Each completed shard is a standalone file with its own
+   footer — readable immediately, independent of any later crash.
+2. **Per-paper checkpointing.** When a shard closes successfully
+   (`.tmp` → final rename), every paper ID it contained is appended to
+   `checkpoint.log` and fsynced. On rerun, those papers are skipped.
+
+The invariant this preserves:
+
+> Every `arxiv_id` in `checkpoint.log` is in a readable shard footer on
+> disk; nothing in a `.tmp` file is ever in the checkpoint.
+
+A mid-tar kill loses at most the in-flight (not-yet-rotated) shard's
+papers; the rerun re-extracts them and writes them into new shards that
+don't overwrite prior output.
+
+### Usage recipe
+
+```bash
+# First invocation — run until done or until the OS kills the process.
+latex-extract \
+  -d /data/arxiv_tars \
+  -o /data/results \
+  -j 2 \
+  --output-format parquet \
+  --papers-per-shard 256 \
+  --resume \
+  --metrics
+
+# On any interruption (jetsam, Ctrl-C, power loss), rerun with the same
+# command. Durable papers are skipped; only the in-flight shard's work
+# (≤ 256 papers) is redone.
+```
+
+At 256 papers/shard, a large-corpus run produces many small shards. An
+offline coalescing pass (`parquet merge` or `duckdb COPY`) is
+recommended for downstream consumers.
 
 ## Development
 
