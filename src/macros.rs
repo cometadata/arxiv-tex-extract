@@ -2,6 +2,7 @@ use crate::braces::{extract_command_arg, extract_optional_arg, find_braced_group
 use crate::symbols::CommandReplacer;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use tracing::warn;
 
@@ -324,6 +325,16 @@ const MAX_EXPANSION_BYTES: usize = 50_000_000;
 /// (e.g. \foo -> \bar -> "final"). For inputs above 5MB, the cap is reduced
 /// from 5 to 3 passes to limit worst-case scanning.
 pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
+    expand_macros_cancellable(text, macros, None)
+}
+
+/// Cancellable variant of [`expand_macros`]. If `cancel` is `Some` and
+/// flips to `true` between passes, returns the last bounded buffer early.
+pub fn expand_macros_cancellable(
+    text: &str,
+    macros: &HashMap<String, String>,
+    cancel: Option<&AtomicBool>,
+) -> String {
     if macros.is_empty() {
         return text.to_string();
     }
@@ -339,6 +350,16 @@ pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
 
     let mut result = text.to_string();
     for pass in 0..max_passes {
+        if let Some(c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                warn!(
+                    pass,
+                    input_bytes = input_len,
+                    "macro expansion cancelled by timeout signal",
+                );
+                return result;
+            }
+        }
         // If the prior pass already produced output at or beyond the cap,
         // skip running another pass — the next one can only grow further.
         if result.len() > size_cap {
@@ -378,6 +399,16 @@ pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
 ///
 /// Iterates up to 3 passes (2 for large inputs) to resolve nested parametric macros.
 pub fn expand_parametric_macros(text: &str, macros: &[ParametricMacro]) -> String {
+    expand_parametric_macros_cancellable(text, macros, None)
+}
+
+/// Cancellable variant of [`expand_parametric_macros`]. Polls `cancel` at
+/// the top of each pass and between macros within a pass.
+pub fn expand_parametric_macros_cancellable(
+    text: &str,
+    macros: &[ParametricMacro],
+    cancel: Option<&AtomicBool>,
+) -> String {
     if macros.is_empty() {
         return text.to_string();
     }
@@ -390,8 +421,28 @@ pub fn expand_parametric_macros(text: &str, macros: &[ParametricMacro]) -> Strin
     let mut result = text.to_string();
 
     'passes: for pass in 0..max_passes {
+        if let Some(c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                warn!(
+                    pass,
+                    input_bytes = input_len,
+                    "parametric macro expansion cancelled by timeout signal",
+                );
+                return result;
+            }
+        }
         let prev = result.clone();
         for mac in macros {
+            if let Some(c) = cancel {
+                if c.load(Ordering::Relaxed) {
+                    warn!(
+                        pass,
+                        macro_name = %mac.name,
+                        "parametric macro expansion cancelled mid-pass",
+                    );
+                    return result;
+                }
+            }
             result = expand_single_parametric(&result, mac);
             if result.len() > size_cap {
                 warn!(

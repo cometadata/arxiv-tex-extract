@@ -13,6 +13,7 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -24,7 +25,7 @@ use latex_extract::archive::{self, PaperArchive};
 use latex_extract::checkpoint;
 use latex_extract::metrics::{self, Outcome, StatusCounts, TarMetrics};
 use latex_extract::output::ParquetShardWriter;
-use latex_extract::pipeline::extract_text_timed;
+use latex_extract::pipeline::extract_text_timed_cancellable;
 use latex_extract::result::ExtractionResult;
 
 /// Default maximum combined .tex content size (20MB).
@@ -781,9 +782,10 @@ fn classify_result(result: &ExtractionResult) -> Outcome {
 /// Process a single paper with panic isolation and a per-document timeout.
 ///
 /// Spawns a dedicated thread for extraction so that stuck documents (infinite
-/// macro loops, pathological regex) don't block the rayon worker pool. A
-/// timed-out thread is intentionally leaked — at <0.01% timeout rate across
-/// 2.7M documents, ~270 leaked threads over hours of runtime is negligible.
+/// macro loops, pathological regex) don't block the rayon worker pool. On
+/// timeout the parent sets a shared `AtomicBool` cancel flag; the spawned
+/// thread polls it between pipeline stages (src/pipeline.rs, src/macros.rs)
+/// and exits cooperatively instead of being silently leaked.
 fn extract_with_timeout(
     paper: &PaperArchive,
     source_tar: Option<&str>,
@@ -862,6 +864,9 @@ fn extract_with_timeout(
     let entry_name = paper.entry_name.clone();
     let source_tar_owned = source_tar.map(|s| s.to_string());
 
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_worker = Arc::clone(&cancel);
+
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
@@ -871,13 +876,15 @@ fn extract_with_timeout(
             file_type,
             entry_name,
         };
-        let result = process_paper(&paper, source_tar_owned.as_deref());
+        let result = process_paper(&paper, source_tar_owned.as_deref(), Some(&cancel_worker));
         let _ = tx.send(result);
     });
 
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Signal the extractor thread to wind down on its next checkpoint.
+            cancel.store(true, Ordering::Relaxed);
             error!(
                 category = "timeout",
                 arxiv_id = %paper.arxiv_id,
@@ -927,7 +934,14 @@ fn extract_with_timeout(
 }
 
 /// Process a single paper with panic isolation.
-fn process_paper(paper: &PaperArchive, source_tar: Option<&str>) -> ExtractionResult {
+///
+/// `cancel` is passed through to the extraction pipeline so that a parent
+/// timeout on `extract_with_timeout` can steer this work to exit early.
+fn process_paper(
+    paper: &PaperArchive,
+    source_tar: Option<&str>,
+    cancel: Option<&AtomicBool>,
+) -> ExtractionResult {
     if paper.tex_files.is_empty() {
         return ExtractionResult {
             arxiv_id: paper.arxiv_id.clone(),
@@ -950,7 +964,7 @@ fn process_paper(paper: &PaperArchive, source_tar: Option<&str>) -> ExtractionRe
     let num_files = tex_files.len();
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        extract_text_timed(&tex_files)
+        extract_text_timed_cancellable(&tex_files, cancel)
     }));
 
     match result {
