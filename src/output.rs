@@ -1,4 +1,5 @@
 use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -50,6 +51,9 @@ pub struct ParquetShardWriter {
     shard_index: usize,
     max_rows: usize,
     max_bytes: usize,
+    /// Rotate after this many papers, independent of max_rows / max_bytes.
+    /// Set to `usize::MAX` to disable paper-count rotation.
+    papers_per_shard: usize,
     /// Rows awaiting the next micro-batch flush.
     micro_batch: Vec<ExtractionResult>,
     /// Per-shard state; present while a shard is being written to.
@@ -72,6 +76,7 @@ impl ParquetShardWriter {
         base_name: &str,
         max_rows: usize,
         max_bytes: usize,
+        papers_per_shard: usize,
     ) -> Self {
         Self {
             schema: Arc::new(result_schema()),
@@ -80,6 +85,7 @@ impl ParquetShardWriter {
             shard_index: 0,
             max_rows,
             max_bytes,
+            papers_per_shard,
             micro_batch: Vec::with_capacity(MICRO_BATCH_ROWS),
             shard: None,
             completed_shards: Vec::new(),
@@ -111,7 +117,7 @@ impl ParquetShardWriter {
             let sw = self.shard.as_ref().expect("shard open");
             (sw.rows_written, sw.bytes_estimate)
         };
-        if rows >= self.max_rows || bytes >= self.max_bytes {
+        if rows >= self.papers_per_shard || rows >= self.max_rows || bytes >= self.max_bytes {
             self.close_shard()?;
         }
 
@@ -299,6 +305,109 @@ fn append_option_u64(builder: &mut UInt64Builder, val: Option<u64>) {
     }
 }
 
+/// Writes extraction results to JSONL shards with automatic splitting.
+///
+/// Mirrors `ParquetShardWriter`'s shape for the JSONL output format. Rotates
+/// to a new shard file once `papers_per_shard` is reached. Each shard is
+/// written to a temp file (`.{name}.tmp`) and atomically renamed on close,
+/// so the shard footer is either fully present or the file doesn't exist.
+pub struct JsonlShardWriter {
+    output_dir: PathBuf,
+    base_name: String,
+    shard_index: usize,
+    /// Rotate after this many papers. Use `usize::MAX` to disable rotation.
+    papers_per_shard: usize,
+    shard: Option<JsonlShardState>,
+    completed_shards: Vec<PathBuf>,
+}
+
+struct JsonlShardState {
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    writer: BufWriter<File>,
+    rows_written: usize,
+}
+
+impl JsonlShardWriter {
+    pub fn new(output_dir: &Path, base_name: &str, papers_per_shard: usize) -> Self {
+        Self {
+            output_dir: output_dir.to_path_buf(),
+            base_name: base_name.to_string(),
+            shard_index: 0,
+            papers_per_shard,
+            shard: None,
+            completed_shards: Vec::new(),
+        }
+    }
+
+    /// Serialize and append a single result, rotating the shard if needed.
+    pub fn write(&mut self, result: &ExtractionResult) -> Result<()> {
+        self.ensure_shard_open()?;
+        {
+            let sw = self.shard.as_mut().expect("shard open");
+            serde_json::to_writer(&mut sw.writer, result)
+                .context("serializing ExtractionResult to JSONL")?;
+            sw.writer.write_all(b"\n")?;
+            sw.rows_written += 1;
+        }
+
+        let rows = self.shard.as_ref().map_or(0, |s| s.rows_written);
+        if rows >= self.papers_per_shard {
+            self.close_shard()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_shard_open(&mut self) -> Result<()> {
+        if self.shard.is_some() {
+            return Ok(());
+        }
+        let shard_name = if self.shard_index == 0 {
+            format!("{}.jsonl", self.base_name)
+        } else {
+            format!("{}_{:03}.jsonl", self.base_name, self.shard_index)
+        };
+        let final_path = self.output_dir.join(&shard_name);
+        let temp_path = self.output_dir.join(format!(".{}.tmp", shard_name));
+
+        let file = File::create(&temp_path)
+            .with_context(|| format!("creating temp file {}", temp_path.display()))?;
+        let writer = BufWriter::new(file);
+
+        self.shard = Some(JsonlShardState {
+            final_path,
+            temp_path,
+            writer,
+            rows_written: 0,
+        });
+        Ok(())
+    }
+
+    fn close_shard(&mut self) -> Result<()> {
+        let mut sw = self.shard.take().expect("shard open");
+        sw.writer.flush()?;
+        drop(sw.writer);
+        fs::rename(&sw.temp_path, &sw.final_path).with_context(|| {
+            format!(
+                "renaming {} to {}",
+                sw.temp_path.display(),
+                sw.final_path.display()
+            )
+        })?;
+        self.completed_shards.push(sw.final_path);
+        self.shard_index += 1;
+        Ok(())
+    }
+
+    /// Flush and close the trailing shard.
+    pub fn finish(mut self) -> Result<Vec<PathBuf>> {
+        if self.shard.is_some() {
+            self.close_shard()?;
+        }
+        Ok(self.completed_shards)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,7 +451,8 @@ mod tests {
     #[test]
     fn test_write_and_read_parquet() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = ParquetShardWriter::new(dir.path(), "test", 10_000, 256_000_000);
+        let mut writer =
+            ParquetShardWriter::new(dir.path(), "test", 10_000, 256_000_000, usize::MAX);
 
         writer.write(make_result("2401.00001", "Hello world")).unwrap();
         writer.write(make_error_result("2401.00002")).unwrap();
@@ -368,7 +478,8 @@ mod tests {
     fn test_shard_splitting() {
         let dir = tempfile::tempdir().unwrap();
         // max_rows = 2 to force splitting
-        let mut writer = ParquetShardWriter::new(dir.path(), "split", 2, 256_000_000);
+        let mut writer =
+            ParquetShardWriter::new(dir.path(), "split", 2, 256_000_000, usize::MAX);
 
         writer.write(make_result("a", "text1")).unwrap();
         writer.write(make_result("b", "text2")).unwrap();
@@ -384,7 +495,8 @@ mod tests {
     #[test]
     fn test_atomic_write_no_tmp_files() {
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = ParquetShardWriter::new(dir.path(), "atomic", 10_000, 256_000_000);
+        let mut writer =
+            ParquetShardWriter::new(dir.path(), "atomic", 10_000, 256_000_000, usize::MAX);
         writer.write(make_result("x", "data")).unwrap();
         let _shards = writer.finish().unwrap();
 
@@ -397,7 +509,8 @@ mod tests {
     #[test]
     fn test_empty_writer() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = ParquetShardWriter::new(dir.path(), "empty", 10_000, 256_000_000);
+        let writer =
+            ParquetShardWriter::new(dir.path(), "empty", 10_000, 256_000_000, usize::MAX);
         let shards = writer.finish().unwrap();
         assert!(shards.is_empty());
     }
@@ -414,7 +527,8 @@ mod tests {
         // must flush at least one micro-batch — so the in-memory buffer
         // is < MICRO_BATCH_ROWS.
         let dir = tempfile::tempdir().unwrap();
-        let mut writer = ParquetShardWriter::new(dir.path(), "mb", 5000, usize::MAX);
+        let mut writer =
+            ParquetShardWriter::new(dir.path(), "mb", 5000, usize::MAX, usize::MAX);
         for i in 0..300 {
             writer.write(make_result(&format!("id{i:03}"), "text")).unwrap();
         }
@@ -436,5 +550,77 @@ mod tests {
         let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 300);
+    }
+
+    #[test]
+    fn test_papers_per_shard_rotates_independent_of_max_rows() {
+        // max_rows is generous; papers_per_shard=3 should drive rotation.
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = ParquetShardWriter::new(dir.path(), "pps", 1_000_000, usize::MAX, 3);
+
+        for i in 0..7 {
+            writer
+                .write(make_result(&format!("id{i:03}"), "text"))
+                .unwrap();
+        }
+
+        let shards = writer.finish().unwrap();
+        assert_eq!(shards.len(), 3, "expected 3 shards: {:?}", shards);
+        assert!(shards[0].ends_with("pps.parquet"));
+        assert!(shards[1].ends_with("pps_001.parquet"));
+        assert!(shards[2].ends_with("pps_002.parquet"));
+    }
+
+    #[test]
+    fn test_jsonl_shard_writer_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = JsonlShardWriter::new(dir.path(), "jshard", 2);
+
+        writer.write(&make_result("a", "one")).unwrap();
+        writer.write(&make_result("b", "two")).unwrap();
+        // 2 rows → rotate; third write goes into the next shard.
+        writer.write(&make_result("c", "three")).unwrap();
+
+        let shards = writer.finish().unwrap();
+        assert_eq!(shards.len(), 2, "expected 2 shards: {:?}", shards);
+        assert!(shards[0].ends_with("jshard.jsonl"));
+        assert!(shards[1].ends_with("jshard_001.jsonl"));
+
+        // No .tmp leftovers.
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(!name.ends_with(".tmp"), "temp file left: {name}");
+        }
+
+        // First shard has 2 lines, second has 1.
+        let first = std::fs::read_to_string(&shards[0]).unwrap();
+        let second = std::fs::read_to_string(&shards[1]).unwrap();
+        assert_eq!(first.lines().count(), 2);
+        assert_eq!(second.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_jsonl_shard_writer_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = JsonlShardWriter::new(dir.path(), "empty", 100);
+        let shards = writer.finish().unwrap();
+        assert!(shards.is_empty());
+    }
+
+    #[test]
+    fn test_jsonl_shard_writer_roundtrip_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = JsonlShardWriter::new(dir.path(), "rt", usize::MAX);
+        writer.write(&make_result("2401.00001", "hello")).unwrap();
+        writer.write(&make_error_result("2401.00002")).unwrap();
+
+        let shards = writer.finish().unwrap();
+        assert_eq!(shards.len(), 1);
+
+        let content = std::fs::read_to_string(&shards[0]).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"arxiv_id\":\"2401.00001\""));
+        assert!(lines[1].contains("\"arxiv_id\":\"2401.00002\""));
     }
 }

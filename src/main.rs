@@ -10,7 +10,6 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +24,7 @@ use latex_extract::admission::AdmissionControl;
 use latex_extract::archive::{self, PaperArchive};
 use latex_extract::checkpoint;
 use latex_extract::metrics::{self, Outcome, StatusCounts, TarMetrics};
-use latex_extract::output::ParquetShardWriter;
+use latex_extract::output::{JsonlShardWriter, ParquetShardWriter};
 use latex_extract::pipeline::extract_text_timed_cancellable;
 use latex_extract::result::ExtractionResult;
 
@@ -90,6 +89,13 @@ struct Args {
     /// Maximum bytes (uncompressed estimate) per parquet shard before splitting
     #[arg(long, default_value_t = 256_000_000)]
     max_shard_bytes: usize,
+
+    /// Rotate to a new shard file after this many papers. When set, each
+    /// completed shard is a standalone readable file, so a SIGKILL discards
+    /// only the in-flight shard's rows rather than the whole tar. When unset,
+    /// only `max_shard_rows` / `max_shard_bytes` trigger rotation.
+    #[arg(long)]
+    papers_per_shard: Option<usize>,
 
     /// Resume from checkpoint (skip already-processed tars)
     #[arg(long)]
@@ -185,13 +191,18 @@ fn main() -> Result<()> {
 
     let format = OutputFormat::parse(&args.output_format)?;
 
+    // Paper-count rotation trigger. When --papers-per-shard is unset, use
+    // usize::MAX so the existing max_shard_rows / max_shard_bytes triggers
+    // are the sole determinants of rotation (preserves prior behaviour).
+    let papers_per_shard = args.papers_per_shard.unwrap_or(usize::MAX);
+
     if let Some(input_file) = &args.input_file {
         if input_file.is_dir() {
             let output_dir = args
                 .output_dir
                 .as_ref()
                 .context("--output-dir is required when --input-file is a directory")?;
-            process_batch(input_file, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics, Arc::clone(&admission))?;
+            process_batch(input_file, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, papers_per_shard, args.resume, args.metrics, Arc::clone(&admission))?;
         } else {
             process_single_file(input_file, timeout, max_tex_bytes, max_memory_bytes, text_files, Arc::clone(&admission))?;
         }
@@ -200,7 +211,7 @@ fn main() -> Result<()> {
             .output_dir
             .as_ref()
             .context("--output-dir is required in batch mode")?;
-        process_batch(input_dir, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, args.resume, args.metrics, Arc::clone(&admission))?;
+        process_batch(input_dir, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, papers_per_shard, args.resume, args.metrics, Arc::clone(&admission))?;
     } else {
         anyhow::bail!("Either --input-dir or --input-file must be specified");
     }
@@ -240,6 +251,7 @@ fn process_batch(
     format: OutputFormat,
     max_shard_rows: usize,
     max_shard_bytes: usize,
+    papers_per_shard: usize,
     resume: bool,
     emit_metrics: bool,
     admission: Arc<AdmissionControl>,
@@ -279,12 +291,12 @@ fn process_batch(
         if text_files {
             process_outer_tars_text(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, admission)?;
         } else {
-            process_outer_tars(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, resume, emit_metrics, admission)?;
+            process_outer_tars(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, papers_per_shard, resume, emit_metrics, admission)?;
         }
     } else if text_files {
         process_individual_archives_text(&archive_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, admission)?;
     } else {
-        process_individual_archives(&archive_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, emit_metrics, admission)?;
+        process_individual_archives(&archive_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, papers_per_shard, emit_metrics, admission)?;
     }
 
     Ok(())
@@ -300,6 +312,7 @@ fn process_outer_tars(
     format: OutputFormat,
     max_shard_rows: usize,
     max_shard_bytes: usize,
+    papers_per_shard: usize,
     resume: bool,
     emit_metrics: bool,
     admission: Arc<AdmissionControl>,
@@ -347,7 +360,7 @@ fn process_outer_tars(
     let cp_path = checkpoint_path.clone();
 
     pending.par_iter().for_each(|tar_path| {
-        match process_outer_tar(tar_path, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, emit_metrics, &admission) {
+        match process_outer_tar(tar_path, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, papers_per_shard, emit_metrics, &admission) {
             Ok(tar_counts) => {
                 counts.lock().unwrap().merge(&tar_counts);
 
@@ -392,6 +405,7 @@ fn process_individual_archives(
     format: OutputFormat,
     max_shard_rows: usize,
     max_shard_bytes: usize,
+    papers_per_shard: usize,
     emit_metrics: bool,
     admission: Arc<AdmissionControl>,
 ) -> Result<()> {
@@ -419,6 +433,7 @@ fn process_individual_archives(
                     "individual",
                     max_shard_rows,
                     max_shard_bytes,
+                    papers_per_shard,
                 );
                 for result in rx {
                     let id = result.arxiv_id.clone();
@@ -430,18 +445,16 @@ fn process_individual_archives(
                 writer.finish()?;
             }
             OutputFormat::Jsonl => {
-                let output_path = output_dir_owned.join("results.jsonl");
-                let file = File::create(&output_path)?;
-                let mut writer = BufWriter::new(file);
+                let mut writer =
+                    JsonlShardWriter::new(&output_dir_owned, "results", papers_per_shard);
                 for result in rx {
                     let id = result.arxiv_id.clone();
-                    if let Err(e) = serde_json::to_writer(&mut writer, &result) {
+                    if let Err(e) = writer.write(&result) {
                         error!(category = "io", "JSON write error: {}", e);
                         io_errors_writer.lock().unwrap().record(Outcome::IoError, &id);
                     }
-                    let _ = writer.write_all(b"\n");
                 }
-                writer.flush()?;
+                writer.finish()?;
             }
         }
         Ok(())
@@ -716,6 +729,7 @@ fn process_outer_tar(
     format: OutputFormat,
     max_shard_rows: usize,
     max_shard_bytes: usize,
+    papers_per_shard: usize,
     emit_metrics: bool,
     admission: &Arc<AdmissionControl>,
 ) -> Result<StatusCounts> {
@@ -745,8 +759,13 @@ fn process_outer_tar(
 
     match format {
         OutputFormat::Parquet => {
-            let mut writer =
-                ParquetShardWriter::new(output_dir, &stem, max_shard_rows, max_shard_bytes);
+            let mut writer = ParquetShardWriter::new(
+                output_dir,
+                &stem,
+                max_shard_rows,
+                max_shard_bytes,
+                papers_per_shard,
+            );
 
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
@@ -775,21 +794,17 @@ fn process_outer_tar(
             }
         }
         OutputFormat::Jsonl => {
-            let output_path = output_dir.join(format!("{}.jsonl", stem));
-            let temp_path = output_dir.join(format!(".{}.jsonl.tmp", stem));
-            let output_file = File::create(&temp_path)?;
-            let mut writer = BufWriter::new(output_file);
+            let mut writer = JsonlShardWriter::new(output_dir, &stem, papers_per_shard);
 
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
                     Ok(paper) => {
                         let result = extract_paper_with_trace(&paper, &source_tar, &stem, timeout, max_tex_bytes, max_memory_bytes, admission);
                         counts.record(classify_result(&result), &result.arxiv_id);
-                        if let Err(e) = serde_json::to_writer(&mut writer, &result) {
+                        if let Err(e) = writer.write(&result) {
                             error!(category = "io", tar = %stem, "JSON write error: {}", e);
                             counts.record(Outcome::IoError, &paper.arxiv_id);
                         }
-                        let _ = writer.write_all(b"\n");
                     }
                     Err(e) => {
                         error!(category = "archive", tar = %stem, "entry error: {}", e);
@@ -803,9 +818,9 @@ fn process_outer_tar(
                 }
             });
 
-            writer.flush()?;
-            drop(writer);
-            fs::rename(&temp_path, &output_path)?;
+            if let Err(e) = writer.finish() {
+                error!(category = "io", tar = %stem, "jsonl finish error: {}", e);
+            }
         }
     }
 
