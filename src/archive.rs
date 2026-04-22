@@ -2,11 +2,17 @@ use crate::input_resolve::TexFile;
 use crate::result::FileType;
 use anyhow::{Context, Result};
 use std::io::Read;
+use std::sync::Arc;
 
 /// A paper extracted from an arXiv archive.
+///
+/// `tex_files` is wrapped in `Arc` so that handing the files to a worker
+/// thread (src/main.rs `extract_with_timeout`) and to the panic-isolated
+/// pipeline (`process_paper`) is a cheap refcount bump instead of a deep
+/// Vec<TexFile> clone — previously ~5 MB per paper at both sites.
 pub struct PaperArchive {
     pub arxiv_id: String,
-    pub tex_files: Vec<TexFile>,
+    pub tex_files: Arc<Vec<TexFile>>,
     pub file_type: FileType,
     pub entry_name: String,
 }
@@ -150,7 +156,7 @@ fn process_entry<R: Read>(mut entry: tar::Entry<R>, arxiv_id: &str, path: &str) 
 
     Ok(PaperArchive {
         arxiv_id: arxiv_id.to_string(),
-        tex_files,
+        tex_files: Arc::new(tex_files),
         file_type,
         entry_name: path.to_string(),
     })
@@ -289,7 +295,7 @@ pub fn load_paper_archive(file_path: &std::path::Path) -> Result<PaperArchive> {
         (Vec::new(), FileType::Unknown)
     };
 
-    Ok(PaperArchive { arxiv_id, tex_files, file_type, entry_name: path_str })
+    Ok(PaperArchive { arxiv_id, tex_files: Arc::new(tex_files), file_type, entry_name: path_str })
 }
 
 /// Try to extract .tex files from raw bytes treated as a tar archive.
@@ -386,5 +392,18 @@ mod tests {
             detect_file_type(b"\\documentclass{article}"),
             FileType::Tex
         );
+    }
+
+    #[test]
+    fn paper_archive_tex_files_is_arc() {
+        use std::sync::Arc;
+        let p = PaperArchive {
+            arxiv_id: "x".into(),
+            tex_files: Arc::new(vec![]),
+            file_type: FileType::Unknown,
+            entry_name: "x".into(),
+        };
+        let p2_files = Arc::clone(&p.tex_files);
+        assert!(Arc::ptr_eq(&p.tex_files, &p2_files));
     }
 }

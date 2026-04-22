@@ -854,8 +854,9 @@ fn extract_with_timeout(
         }
     }
 
-    // Clone data for the spawned thread (thread::spawn requires 'static)
-    let tex_files = paper.tex_files.clone();
+    // Clone data for the spawned thread (thread::spawn requires 'static).
+    // tex_files is an Arc<Vec<TexFile>>, so this is a refcount bump.
+    let tex_files = Arc::clone(&paper.tex_files);
     let arxiv_id = paper.arxiv_id.clone();
     let file_type = paper.file_type;
     let entry_name = paper.entry_name.clone();
@@ -944,7 +945,8 @@ fn process_paper(paper: &PaperArchive, source_tar: Option<&str>) -> ExtractionRe
         };
     }
 
-    let tex_files = paper.tex_files.clone();
+    // Arc clone — refcount bump, not a deep copy of the Vec<TexFile>.
+    let tex_files = Arc::clone(&paper.tex_files);
     let num_files = tex_files.len();
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
@@ -1019,16 +1021,17 @@ mod tests {
     use super::*;
     use latex_extract::input_resolve::TexFile;
     use latex_extract::result::FileType;
+    use std::sync::Arc;
 
     #[test]
     fn test_content_size_cap() {
         let large_content = "x".repeat(DEFAULT_MAX_TEX_BYTES + 1);
         let paper = PaperArchive {
             arxiv_id: "test.oversize".into(),
-            tex_files: vec![TexFile {
+            tex_files: Arc::new(vec![TexFile {
                 name: "main.tex".into(),
                 content: large_content,
-            }],
+            }]),
             file_type: FileType::Tex,
             entry_name: "test.gz".into(),
         };
@@ -1042,10 +1045,10 @@ mod tests {
         let content = "x".repeat(100);
         let paper = PaperArchive {
             arxiv_id: "test.custom_limit".into(),
-            tex_files: vec![TexFile {
+            tex_files: Arc::new(vec![TexFile {
                 name: "main.tex".into(),
                 content: content.clone(),
-            }],
+            }]),
             file_type: FileType::Tex,
             entry_name: "test.gz".into(),
         };
@@ -1056,10 +1059,10 @@ mod tests {
         // Same content passes with a larger limit
         let paper2 = PaperArchive {
             arxiv_id: "test.custom_limit_ok".into(),
-            tex_files: vec![TexFile {
+            tex_files: Arc::new(vec![TexFile {
                 name: "main.tex".into(),
                 content,
-            }],
+            }]),
             file_type: FileType::Tex,
             entry_name: "test.gz".into(),
         };
@@ -1076,10 +1079,10 @@ mod tests {
         // before the spawned thread completes.
         let paper = PaperArchive {
             arxiv_id: "test.timeout".into(),
-            tex_files: vec![TexFile {
+            tex_files: Arc::new(vec![TexFile {
                 name: "main.tex".into(),
                 content: r"\documentclass{article}\begin{document}Hello\end{document}".into(),
-            }],
+            }]),
             file_type: FileType::Tex,
             entry_name: "test.gz".into(),
         };
@@ -1094,7 +1097,7 @@ mod tests {
     fn test_normal_extraction_with_timeout() {
         let paper = PaperArchive {
             arxiv_id: "test.normal".into(),
-            tex_files: vec![TexFile {
+            tex_files: Arc::new(vec![TexFile {
                 name: "main.tex".into(),
                 content: r"\documentclass{article}
 \begin{document}
@@ -1102,7 +1105,7 @@ mod tests {
 Hello world.
 \end{document}"
                     .into(),
-            }],
+            }]),
             file_type: FileType::Tex,
             entry_name: "test.gz".into(),
         };
@@ -1116,14 +1119,14 @@ Hello world.
     fn test_extraction_result_has_timing() {
         let paper = PaperArchive {
             arxiv_id: "test.timing".into(),
-            tex_files: vec![TexFile {
+            tex_files: Arc::new(vec![TexFile {
                 name: "main.tex".into(),
                 content: r"\documentclass{article}
 \begin{document}
 Hello.
 \end{document}"
                     .into(),
-            }],
+            }]),
             file_type: FileType::Tex,
             entry_name: "test.gz".into(),
         };
