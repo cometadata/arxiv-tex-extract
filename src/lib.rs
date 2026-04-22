@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod archive;
 pub mod braces;
 pub mod checkpoint;
