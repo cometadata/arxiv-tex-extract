@@ -277,8 +277,7 @@ latex-extract \
 ```
 
 At 256 papers/shard, a large-corpus run produces many small shards. An
-offline coalescing pass (e.g. `parquet merge` or `duckdb COPY`) is
-recommended for downstream consumers.
+offline coalescing pass (e.g. `parquet merge` or `duckdb COPY`) may be useful for downstream consumers.
 
 ## Development
 
