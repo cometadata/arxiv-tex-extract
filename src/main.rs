@@ -333,6 +333,10 @@ fn process_outer_tars(
             }
         }
 
+        // Return freed pages to the OS between tars so RSS plateaus
+        // instead of growing monotonically across the corpus.
+        latex_extract::memory::purge_jemalloc_arenas();
+
         progress.inc(1);
     });
 
