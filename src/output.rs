@@ -137,8 +137,16 @@ impl ParquetShardWriter {
 
         let file = File::create(&temp_path)
             .with_context(|| format!("creating temp file {}", temp_path.display()))?;
+        // Force row-group boundary to align with our micro-batch flushes.
+        // ArrowWriter's default max_row_group_size is 1,048,576 rows, which
+        // means every row we hand it sits in column builders until the shard
+        // is closed — at scale, 4 concurrent writers × 500 MB of buffered
+        // text/string columns each was dominating RSS on the 22 GB corpus.
+        // Aligning the row-group size with MICRO_BATCH_ROWS turns each
+        // write() into a completed row group that lands on disk.
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+            .set_max_row_group_size(MICRO_BATCH_ROWS)
             .build();
         let writer = ArrowWriter::try_new(file, self.schema.clone(), Some(props))?;
 
