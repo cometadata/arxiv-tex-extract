@@ -11,6 +11,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
+use crate::checkpoint;
 use crate::result::ExtractionResult;
 
 /// Build the Arrow schema for extraction results.
@@ -59,6 +60,14 @@ pub struct ParquetShardWriter {
     /// Per-shard state; present while a shard is being written to.
     shard: Option<ShardWriter>,
     completed_shards: Vec<PathBuf>,
+    /// If `Some`, record each completed shard's paper IDs here (after rename)
+    /// via `checkpoint::record_papers`. The invariant this preserves:
+    /// every entry in the checkpoint log is in a readable shard on disk,
+    /// never in a `.tmp` file. `base_name` doubles as the tar identifier.
+    checkpoint_path: Option<PathBuf>,
+    /// IDs buffered for the next shard-close checkpoint flush. Cleared
+    /// after a successful `record_papers` call.
+    pending_ids: Vec<String>,
 }
 
 struct ShardWriter {
@@ -89,7 +98,18 @@ impl ParquetShardWriter {
             micro_batch: Vec::with_capacity(MICRO_BATCH_ROWS),
             shard: None,
             completed_shards: Vec::new(),
+            checkpoint_path: None,
+            pending_ids: Vec::new(),
         }
+    }
+
+    /// Enable per-paper checkpoint logging. Every time a shard is closed
+    /// (renamed from `.tmp` to final), the paper IDs it contained are
+    /// appended to `checkpoint_path` under the current `base_name` and
+    /// fsynced. Pass `None` to disable (default).
+    pub fn with_checkpoint(mut self, checkpoint_path: Option<PathBuf>) -> Self {
+        self.checkpoint_path = checkpoint_path;
+        self
     }
 
     /// Add a result. Triggers a micro-batch flush every `MICRO_BATCH_ROWS`
@@ -102,6 +122,9 @@ impl ParquetShardWriter {
             + 200;
 
         self.ensure_shard_open()?;
+        if self.checkpoint_path.is_some() {
+            self.pending_ids.push(result.arxiv_id.clone());
+        }
         self.micro_batch.push(result);
         {
             let sw = self.shard.as_mut().expect("shard open");
@@ -191,6 +214,14 @@ impl ParquetShardWriter {
         })?;
         self.completed_shards.push(sw.final_path);
         self.shard_index += 1;
+
+        // Checkpoint flush happens strictly after the `.tmp` → final rename
+        // so that every entry in the checkpoint refers to a readable shard.
+        if let Some(cp) = &self.checkpoint_path {
+            checkpoint::record_papers(cp, &self.base_name, &self.pending_ids)?;
+            self.pending_ids.clear();
+        }
+
         Ok(())
     }
 
@@ -319,6 +350,8 @@ pub struct JsonlShardWriter {
     papers_per_shard: usize,
     shard: Option<JsonlShardState>,
     completed_shards: Vec<PathBuf>,
+    checkpoint_path: Option<PathBuf>,
+    pending_ids: Vec<String>,
 }
 
 struct JsonlShardState {
@@ -337,7 +370,15 @@ impl JsonlShardWriter {
             papers_per_shard,
             shard: None,
             completed_shards: Vec::new(),
+            checkpoint_path: None,
+            pending_ids: Vec::new(),
         }
+    }
+
+    /// Enable per-paper checkpoint logging (see `ParquetShardWriter::with_checkpoint`).
+    pub fn with_checkpoint(mut self, checkpoint_path: Option<PathBuf>) -> Self {
+        self.checkpoint_path = checkpoint_path;
+        self
     }
 
     /// Serialize and append a single result, rotating the shard if needed.
@@ -349,6 +390,9 @@ impl JsonlShardWriter {
                 .context("serializing ExtractionResult to JSONL")?;
             sw.writer.write_all(b"\n")?;
             sw.rows_written += 1;
+        }
+        if self.checkpoint_path.is_some() {
+            self.pending_ids.push(result.arxiv_id.clone());
         }
 
         let rows = self.shard.as_ref().map_or(0, |s| s.rows_written);
@@ -396,6 +440,12 @@ impl JsonlShardWriter {
         })?;
         self.completed_shards.push(sw.final_path);
         self.shard_index += 1;
+
+        if let Some(cp) = &self.checkpoint_path {
+            checkpoint::record_papers(cp, &self.base_name, &self.pending_ids)?;
+            self.pending_ids.clear();
+        }
+
         Ok(())
     }
 
@@ -622,5 +672,68 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\"arxiv_id\":\"2401.00001\""));
         assert!(lines[1].contains("\"arxiv_id\":\"2401.00002\""));
+    }
+
+    #[test]
+    fn test_parquet_writer_records_checkpoint_on_shard_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = dir.path().join("checkpoint.log");
+
+        // papers_per_shard=2 → rotate twice with 5 writes, third shard stays
+        // in-flight until finish().
+        let mut writer = ParquetShardWriter::new(dir.path(), "mytar", 1000, usize::MAX, 2)
+            .with_checkpoint(Some(cp.clone()));
+        for i in 0..5 {
+            writer
+                .write(make_result(&format!("2401.{i:05}"), "x"))
+                .unwrap();
+        }
+        // After two rotations (at 2 and 4 papers), 4 IDs should be fsynced.
+        let mid = std::fs::read_to_string(&cp).unwrap();
+        let mid_lines: Vec<&str> = mid.lines().collect();
+        assert_eq!(mid_lines.len(), 4, "expected 4 lines mid-run, got: {mid}");
+        for line in &mid_lines {
+            assert!(line.starts_with("mytar\t"), "bad line: {line}");
+        }
+
+        // finish() closes the 5th (trailing) shard and flushes its ID.
+        writer.finish().unwrap();
+        let final_content = std::fs::read_to_string(&cp).unwrap();
+        assert_eq!(final_content.lines().count(), 5);
+    }
+
+    #[test]
+    fn test_jsonl_writer_records_checkpoint_on_shard_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = dir.path().join("checkpoint.log");
+
+        let mut writer =
+            JsonlShardWriter::new(dir.path(), "mytar", 2).with_checkpoint(Some(cp.clone()));
+        for i in 0..3 {
+            writer.write(&make_result(&format!("2401.{i:05}"), "x")).unwrap();
+        }
+        // One rotation at 2 papers → 2 IDs fsynced before finish.
+        let mid = std::fs::read_to_string(&cp).unwrap();
+        assert_eq!(mid.lines().count(), 2);
+
+        writer.finish().unwrap();
+        let final_content = std::fs::read_to_string(&cp).unwrap();
+        assert_eq!(final_content.lines().count(), 3);
+    }
+
+    #[test]
+    fn test_checkpoint_disabled_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = dir.path().join("checkpoint.log");
+
+        let mut writer =
+            ParquetShardWriter::new(dir.path(), "nocp", 1000, usize::MAX, 2);
+        for i in 0..5 {
+            writer
+                .write(make_result(&format!("id{i}"), "x"))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        assert!(!cp.exists(), "no checkpoint file should be created");
     }
 }

@@ -196,13 +196,18 @@ fn main() -> Result<()> {
     // are the sole determinants of rotation (preserves prior behaviour).
     let papers_per_shard = args.papers_per_shard.unwrap_or(usize::MAX);
 
+    // Per-paper checkpointing is gated on the same opt-in flag. When set,
+    // writers emit (tar, arxiv_id) checkpoint entries at each shard close,
+    // and --resume skips papers already durable on disk.
+    let enable_per_paper_checkpoint = args.papers_per_shard.is_some();
+
     if let Some(input_file) = &args.input_file {
         if input_file.is_dir() {
             let output_dir = args
                 .output_dir
                 .as_ref()
                 .context("--output-dir is required when --input-file is a directory")?;
-            process_batch(input_file, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, papers_per_shard, args.resume, args.metrics, Arc::clone(&admission))?;
+            process_batch(input_file, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, papers_per_shard, enable_per_paper_checkpoint, args.resume, args.metrics, Arc::clone(&admission))?;
         } else {
             process_single_file(input_file, timeout, max_tex_bytes, max_memory_bytes, text_files, Arc::clone(&admission))?;
         }
@@ -211,7 +216,7 @@ fn main() -> Result<()> {
             .output_dir
             .as_ref()
             .context("--output-dir is required in batch mode")?;
-        process_batch(input_dir, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, papers_per_shard, args.resume, args.metrics, Arc::clone(&admission))?;
+        process_batch(input_dir, output_dir, timeout, max_tex_bytes, max_memory_bytes, text_files, format, args.max_shard_rows, args.max_shard_bytes, papers_per_shard, enable_per_paper_checkpoint, args.resume, args.metrics, Arc::clone(&admission))?;
     } else {
         anyhow::bail!("Either --input-dir or --input-file must be specified");
     }
@@ -252,6 +257,7 @@ fn process_batch(
     max_shard_rows: usize,
     max_shard_bytes: usize,
     papers_per_shard: usize,
+    enable_per_paper_checkpoint: bool,
     resume: bool,
     emit_metrics: bool,
     admission: Arc<AdmissionControl>,
@@ -291,12 +297,12 @@ fn process_batch(
         if text_files {
             process_outer_tars_text(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, admission)?;
         } else {
-            process_outer_tars(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, papers_per_shard, resume, emit_metrics, admission)?;
+            process_outer_tars(&tar_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, papers_per_shard, enable_per_paper_checkpoint, resume, emit_metrics, admission)?;
         }
     } else if text_files {
         process_individual_archives_text(&archive_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, admission)?;
     } else {
-        process_individual_archives(&archive_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, papers_per_shard, emit_metrics, admission)?;
+        process_individual_archives(&archive_files, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, papers_per_shard, enable_per_paper_checkpoint, resume, emit_metrics, admission)?;
     }
 
     Ok(())
@@ -313,27 +319,35 @@ fn process_outer_tars(
     max_shard_rows: usize,
     max_shard_bytes: usize,
     papers_per_shard: usize,
+    enable_per_paper_checkpoint: bool,
     resume: bool,
     emit_metrics: bool,
     admission: Arc<AdmissionControl>,
 ) -> Result<()> {
     let checkpoint_path = output_dir.join("checkpoint.log");
 
-    let completed = if resume {
-        let set = checkpoint::load_checkpoint(&checkpoint_path)?;
-        if !set.is_empty() {
-            info!("Resuming: {} tars already completed", set.len());
+    let checkpoint_state = if resume {
+        let cp = checkpoint::load(&checkpoint_path)?;
+        if !cp.tars.is_empty() || !cp.papers.is_empty() {
+            info!(
+                "Resuming: {} tars, {} papers already completed",
+                cp.tars.len(),
+                cp.papers.len()
+            );
         }
-        set
+        cp
     } else {
-        std::collections::HashSet::new()
+        checkpoint::Checkpoint::default()
     };
+
+    let resume_papers: Arc<std::collections::HashSet<(String, String)>> =
+        Arc::new(checkpoint_state.papers.clone());
 
     let pending: Vec<&PathBuf> = tar_files
         .iter()
         .filter(|p| {
             let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-            !completed.contains(&name)
+            !checkpoint_state.tars.contains(&name)
         })
         .collect();
 
@@ -360,7 +374,7 @@ fn process_outer_tars(
     let cp_path = checkpoint_path.clone();
 
     pending.par_iter().for_each(|tar_path| {
-        match process_outer_tar(tar_path, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, papers_per_shard, emit_metrics, &admission) {
+        match process_outer_tar(tar_path, output_dir, timeout, max_tex_bytes, max_memory_bytes, format, max_shard_rows, max_shard_bytes, papers_per_shard, enable_per_paper_checkpoint, &resume_papers, emit_metrics, &admission) {
             Ok(tar_counts) => {
                 counts.lock().unwrap().merge(&tar_counts);
 
@@ -396,6 +410,10 @@ fn process_outer_tars(
 }
 
 /// Process individual .tar.gz or .gz archives with parallel extraction.
+///
+/// In files-mode the checkpoint identifier for a paper is the writer's
+/// output-filename stem — `"individual"` for Parquet, `"results"` for JSONL.
+/// Resume within a single format works; switching formats forfeits skip.
 fn process_individual_archives(
     files: &[PathBuf],
     output_dir: &Path,
@@ -406,10 +424,35 @@ fn process_individual_archives(
     max_shard_rows: usize,
     max_shard_bytes: usize,
     papers_per_shard: usize,
+    enable_per_paper_checkpoint: bool,
+    resume: bool,
     emit_metrics: bool,
     admission: Arc<AdmissionControl>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
+
+    let writer_stem = match format {
+        OutputFormat::Parquet => "individual",
+        OutputFormat::Jsonl => "results",
+    };
+    cleanup_stale_tmp_shards(output_dir, writer_stem);
+
+    let checkpoint_path_full = output_dir.join("checkpoint.log");
+    let checkpoint_path_for_writer = if enable_per_paper_checkpoint {
+        Some(checkpoint_path_full.clone())
+    } else {
+        None
+    };
+
+    let resume_papers: Arc<std::collections::HashSet<(String, String)>> = if resume {
+        let cp = checkpoint::load(&checkpoint_path_full)?;
+        if !cp.papers.is_empty() {
+            info!("Resuming: {} papers already completed", cp.papers.len());
+        }
+        Arc::new(cp.papers)
+    } else {
+        Arc::new(std::collections::HashSet::new())
+    };
 
     let progress = ProgressBar::new(files.len() as u64);
     progress.set_style(
@@ -425,16 +468,19 @@ fn process_individual_archives(
 
     let output_dir_owned = output_dir.to_path_buf();
     let io_errors_writer = io_errors.clone();
+    let checkpoint_for_writer = checkpoint_path_for_writer.clone();
+    let writer_stem_owned = writer_stem.to_string();
     let writer_handle = thread::spawn(move || -> Result<()> {
         match format {
             OutputFormat::Parquet => {
                 let mut writer = ParquetShardWriter::new(
                     &output_dir_owned,
-                    "individual",
+                    &writer_stem_owned,
                     max_shard_rows,
                     max_shard_bytes,
                     papers_per_shard,
-                );
+                )
+                .with_checkpoint(checkpoint_for_writer.clone());
                 for result in rx {
                     let id = result.arxiv_id.clone();
                     if let Err(e) = writer.write(result) {
@@ -445,8 +491,12 @@ fn process_individual_archives(
                 writer.finish()?;
             }
             OutputFormat::Jsonl => {
-                let mut writer =
-                    JsonlShardWriter::new(&output_dir_owned, "results", papers_per_shard);
+                let mut writer = JsonlShardWriter::new(
+                    &output_dir_owned,
+                    &writer_stem_owned,
+                    papers_per_shard,
+                )
+                .with_checkpoint(checkpoint_for_writer.clone());
                 for result in rx {
                     let id = result.arxiv_id.clone();
                     if let Err(e) = writer.write(&result) {
@@ -462,12 +512,34 @@ fn process_individual_archives(
 
     let counts_ref = counts.clone();
     let admission_ref = admission;
+    let resume_papers_ref = resume_papers.clone();
+    let resume_stem = writer_stem.to_string();
     files.par_iter().for_each_with(tx, |tx, path| {
-        let result = match archive::load_paper_archive(path) {
+        match archive::load_paper_archive(path) {
             Ok(paper) => {
-                let result = extract_with_timeout(&paper, None, timeout, max_tex_bytes, max_memory_bytes, &admission_ref);
-                counts_ref.lock().unwrap().record(classify_result(&result), &result.arxiv_id);
-                result
+                if resume_papers_ref
+                    .contains(&(resume_stem.clone(), paper.arxiv_id.clone()))
+                {
+                    counts_ref
+                        .lock()
+                        .unwrap()
+                        .record(Outcome::SkippedResume, &paper.arxiv_id);
+                    progress.inc(1);
+                    return;
+                }
+                let result = extract_with_timeout(
+                    &paper,
+                    None,
+                    timeout,
+                    max_tex_bytes,
+                    max_memory_bytes,
+                    &admission_ref,
+                );
+                counts_ref
+                    .lock()
+                    .unwrap()
+                    .record(classify_result(&result), &result.arxiv_id);
+                let _ = tx.send(result);
             }
             Err(e) => {
                 let id = path
@@ -477,7 +549,7 @@ fn process_individual_archives(
                     .to_string();
                 error!(category = "archive", arxiv_id = %id, "load failure: {}", e);
                 counts_ref.lock().unwrap().record(Outcome::ArchiveError, &id);
-                ExtractionResult {
+                let err_result = ExtractionResult {
                     arxiv_id: id,
                     source_tar: None,
                     status: "error".into(),
@@ -490,10 +562,10 @@ fn process_individual_archives(
                     peak_memory_bytes: None,
                     file_type: None,
                     entry_name: None,
-                }
+                };
+                let _ = tx.send(err_result);
             }
-        };
-        let _ = tx.send(result);
+        }
         progress.inc(1);
     });
 
@@ -526,6 +598,29 @@ fn process_individual_archives(
 /// Sanitize an arxiv ID for use as a filename (replace `/` with `_`).
 fn sanitize_id(id: &str) -> String {
     id.replace('/', "_")
+}
+
+/// Delete any `.tmp` shard files in `output_dir` that belong to `stem`.
+///
+/// Called before a tar (or files-mode batch) starts so that debris from a
+/// prior-run kill doesn't confuse downstream readers. By the checkpoint
+/// invariant (entries only appear after `.tmp` → final rename), nothing
+/// in a `.tmp` is referenced by the checkpoint, so these are always
+/// discardable.
+fn cleanup_stale_tmp_shards(output_dir: &Path, stem: &str) {
+    let Ok(entries) = fs::read_dir(output_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Temp files look like `.{stem}.parquet.tmp`, `.{stem}_001.parquet.tmp`,
+        // or the JSONL equivalents. Match on the `.{stem}` prefix and `.tmp`
+        // suffix to avoid touching unrelated hidden files.
+        if name_str.starts_with(&format!(".{}", stem)) && name_str.ends_with(".tmp") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Derive output filename stem from a path, stripping double extensions.
@@ -730,6 +825,8 @@ fn process_outer_tar(
     max_shard_rows: usize,
     max_shard_bytes: usize,
     papers_per_shard: usize,
+    enable_per_paper_checkpoint: bool,
+    resume_papers: &Arc<std::collections::HashSet<(String, String)>>,
     emit_metrics: bool,
     admission: &Arc<AdmissionControl>,
 ) -> Result<StatusCounts> {
@@ -743,6 +840,18 @@ fn process_outer_tar(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+
+    // Clean up any `.tmp` shard files left by a prior-run kill. By the
+    // checkpoint invariant (entries only appear after `.tmp` → final
+    // rename) these contain only rows not yet in the checkpoint, so
+    // discarding them is safe.
+    cleanup_stale_tmp_shards(output_dir, &stem);
+
+    let checkpoint_path = if enable_per_paper_checkpoint {
+        Some(output_dir.join("checkpoint.log"))
+    } else {
+        None
+    };
 
     let start = std::time::Instant::now();
     debug!(tar = %source_tar, "processing tar");
@@ -765,16 +874,21 @@ fn process_outer_tar(
                 max_shard_rows,
                 max_shard_bytes,
                 papers_per_shard,
-            );
+            )
+            .with_checkpoint(checkpoint_path.clone());
 
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
                     Ok(paper) => {
-                        let result = extract_paper_with_trace(&paper, &source_tar, &stem, timeout, max_tex_bytes, max_memory_bytes, admission);
-                        counts.record(classify_result(&result), &result.arxiv_id);
-                        if let Err(e) = writer.write(result) {
-                            error!(category = "io", tar = %stem, "parquet write error: {}", e);
-                            counts.record(Outcome::IoError, &paper.arxiv_id);
+                        if resume_papers.contains(&(stem.clone(), paper.arxiv_id.clone())) {
+                            counts.record(Outcome::SkippedResume, &paper.arxiv_id);
+                        } else {
+                            let result = extract_paper_with_trace(&paper, &source_tar, &stem, timeout, max_tex_bytes, max_memory_bytes, admission);
+                            counts.record(classify_result(&result), &result.arxiv_id);
+                            if let Err(e) = writer.write(result) {
+                                error!(category = "io", tar = %stem, "parquet write error: {}", e);
+                                counts.record(Outcome::IoError, &paper.arxiv_id);
+                            }
                         }
                     }
                     Err(e) => {
@@ -794,16 +908,21 @@ fn process_outer_tar(
             }
         }
         OutputFormat::Jsonl => {
-            let mut writer = JsonlShardWriter::new(output_dir, &stem, papers_per_shard);
+            let mut writer = JsonlShardWriter::new(output_dir, &stem, papers_per_shard)
+                .with_checkpoint(checkpoint_path.clone());
 
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
                     Ok(paper) => {
-                        let result = extract_paper_with_trace(&paper, &source_tar, &stem, timeout, max_tex_bytes, max_memory_bytes, admission);
-                        counts.record(classify_result(&result), &result.arxiv_id);
-                        if let Err(e) = writer.write(&result) {
-                            error!(category = "io", tar = %stem, "JSON write error: {}", e);
-                            counts.record(Outcome::IoError, &paper.arxiv_id);
+                        if resume_papers.contains(&(stem.clone(), paper.arxiv_id.clone())) {
+                            counts.record(Outcome::SkippedResume, &paper.arxiv_id);
+                        } else {
+                            let result = extract_paper_with_trace(&paper, &source_tar, &stem, timeout, max_tex_bytes, max_memory_bytes, admission);
+                            counts.record(classify_result(&result), &result.arxiv_id);
+                            if let Err(e) = writer.write(&result) {
+                                error!(category = "io", tar = %stem, "JSON write error: {}", e);
+                                counts.record(Outcome::IoError, &paper.arxiv_id);
+                            }
                         }
                     }
                     Err(e) => {
