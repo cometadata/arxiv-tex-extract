@@ -71,7 +71,7 @@ latex-extract \
 ```
 
 `--papers-per-shard 256` bounds the blast radius of a process-wide SIGKILL
-(macOS jetsam / Linux OOM) to the most recent shard rather than the whole
+from OOMs to the most recent shard rather than the whole
 tar. See [Jetsam / OOM resilience](#jetsam--oom-resilience) below.
 
 ## CLI Reference
@@ -235,18 +235,17 @@ only hold non-checkpointed rows, so discarding them is safe.
 
 ## Jetsam / OOM resilience
 
-Long batch runs on large corpora can hit process-wide SIGKILL from macOS
-jetsam or the Linux OOM-killer. Without `--papers-per-shard`, a kill in the
+Long batch runs on large corpora can hit process-wide SIGKILL from OOM errors. Without `--papers-per-shard`, a kill in the
 middle of a tar loses every paper in the in-flight tar's output (Parquet
 files only become readable once the footer is written at shard close).
 
 With `--papers-per-shard N`, two things change:
 
-1. **Shard rotation.** The writer closes and renames a shard every N papers
+1. The writer closes and renames a shard every N papers
    (in addition to the existing `--max-shard-rows` / `--max-shard-bytes`
    triggers). Each completed shard is a standalone file with its own
-   footer — readable immediately, independent of any later crash.
-2. **Per-paper checkpointing.** When a shard closes successfully
+   footer, meaning its readable immediately, independent of any later crash.
+2. When a shard closes successfully
    (`.tmp` → final rename), every paper ID it contained is appended to
    `checkpoint.log` and fsynced. On rerun, those papers are skipped.
 
@@ -256,7 +255,7 @@ The invariant this preserves:
 > disk; nothing in a `.tmp` file is ever in the checkpoint.
 
 A mid-tar kill loses at most the in-flight (not-yet-rotated) shard's
-papers; the rerun re-extracts them and writes them into new shards that
+papers, so the rerun re-extracts them and writes them into new shards that
 don't overwrite prior output.
 
 ### Usage recipe
@@ -278,7 +277,7 @@ latex-extract \
 ```
 
 At 256 papers/shard, a large-corpus run produces many small shards. An
-offline coalescing pass (`parquet merge` or `duckdb COPY`) is
+offline coalescing pass (e.g. `parquet merge` or `duckdb COPY`) is
 recommended for downstream consumers.
 
 ## Development
