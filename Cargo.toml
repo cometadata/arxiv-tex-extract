@@ -21,6 +21,13 @@ encoding_rs = "0.8"
 arrow = { version = "54", default-features = false, features = ["prettyprint"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
 
+[features]
+# Compile in test-only hooks (notably ARXIV_TEX_EXTRACT_KILL_AFTER_PAPERS,
+# used by the kill+resume integration tests). Off in release builds so no
+# exit(137) surprise ships to users. Enable with
+# `cargo test --features test-hooks` or `cargo build --features test-hooks`.
+test-hooks = []
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"

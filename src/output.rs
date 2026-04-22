@@ -112,6 +112,15 @@ impl ParquetShardWriter {
         self
     }
 
+    /// Start emitting new shards at `shard_index` instead of 0.
+    ///
+    /// Used on `--resume` so the first fresh shard doesn't overwrite a
+    /// prior-run shard sitting at `{base_name}.parquet` / `{base_name}_000.parquet`.
+    pub fn with_starting_shard_index(mut self, shard_index: usize) -> Self {
+        self.shard_index = shard_index;
+        self
+    }
+
     /// Add a result. Triggers a micro-batch flush every `MICRO_BATCH_ROWS`
     /// and rotates to a new shard once `max_rows` / `max_bytes` is reached.
     pub fn write(&mut self, result: ExtractionResult) -> Result<()> {
@@ -378,6 +387,13 @@ impl JsonlShardWriter {
     /// Enable per-paper checkpoint logging (see `ParquetShardWriter::with_checkpoint`).
     pub fn with_checkpoint(mut self, checkpoint_path: Option<PathBuf>) -> Self {
         self.checkpoint_path = checkpoint_path;
+        self
+    }
+
+    /// Start emitting new shards at `shard_index` instead of 0 (see
+    /// `ParquetShardWriter::with_starting_shard_index`).
+    pub fn with_starting_shard_index(mut self, shard_index: usize) -> Self {
+        self.shard_index = shard_index;
         self
     }
 

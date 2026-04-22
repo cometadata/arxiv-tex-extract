@@ -5,11 +5,20 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
-use arrow::array::StringArray;
+use arrow::array::{Array, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Helper: create a minimal tar containing a single .gz paper.
 fn create_test_tar(dir: &Path, name: &str, arxiv_id: &str, tex_content: &str) -> std::path::PathBuf {
+    create_test_tar_with_papers(dir, name, &[(arxiv_id, tex_content)])
+}
+
+/// Helper: create a tar containing multiple .gz papers.
+fn create_test_tar_with_papers(
+    dir: &Path,
+    name: &str,
+    papers: &[(&str, &str)],
+) -> std::path::PathBuf {
     use flate2::write::GzEncoder;
     use flate2::Compression;
 
@@ -17,17 +26,21 @@ fn create_test_tar(dir: &Path, name: &str, arxiv_id: &str, tex_content: &str) ->
     let tar_file = fs::File::create(&tar_path).unwrap();
     let mut tar_builder = tar::Builder::new(tar_file);
 
-    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-    gz.write_all(tex_content.as_bytes()).unwrap();
-    let gz_bytes = gz.finish().unwrap();
+    for (arxiv_id, tex_content) in papers {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(tex_content.as_bytes()).unwrap();
+        let gz_bytes = gz.finish().unwrap();
 
-    let gz_name = format!("{}.gz", arxiv_id);
-    let mut header = tar::Header::new_gnu();
-    header.set_size(gz_bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
+        let gz_name = format!("{}.gz", arxiv_id);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(gz_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
 
-    tar_builder.append_data(&mut header, &gz_name, &gz_bytes[..]).unwrap();
+        tar_builder
+            .append_data(&mut header, &gz_name, &gz_bytes[..])
+            .unwrap();
+    }
     tar_builder.finish().unwrap();
 
     tar_path
@@ -286,4 +299,215 @@ fn test_files_mode_mixed_formats() {
 
     let text2 = fs::read_to_string(&bundled_path).unwrap();
     assert!(text2.contains("From tar gz bundle"), "got: {text2}");
+}
+
+// ---------------------------------------------------------------------------
+// SIGKILL + resume round-trip tests.
+//
+// Gated on the `test-hooks` Cargo feature: these require the binary's
+// `ARXIV_TEX_EXTRACT_KILL_AFTER_PAPERS` hook to be compiled in. Run with:
+//   cargo test --features test-hooks
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "test-hooks")]
+fn collect_all_arxiv_ids(dir: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().map_or(false, |e| e == "parquet") {
+            let file = fs::File::open(&path).unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap()
+                .build()
+                .unwrap();
+            for batch_result in reader {
+                let batch = batch_result.unwrap();
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for i in 0..col.len() {
+                    ids.push(col.value(i).to_string());
+                }
+            }
+        }
+    }
+    ids.sort();
+    ids
+}
+
+#[cfg(feature = "test-hooks")]
+fn six_papers() -> Vec<(String, String)> {
+    (1..=6)
+        .map(|i| {
+            let id = format!("2401.{:05}", i);
+            let tex = format!(
+                r"\documentclass{{article}}\begin{{document}}Paper {}.\end{{document}}",
+                i
+            );
+            (id, tex)
+        })
+        .collect()
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn test_kill_resume_round_trip_tars_mode() {
+    let input_dir = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+
+    let papers = six_papers();
+    let papers_refs: Vec<(&str, &str)> =
+        papers.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    create_test_tar_with_papers(input_dir.path(), "killtest.tar", &papers_refs);
+
+    // Run 1: kill after 3 successful writes. --papers-per-shard 2 means
+    // the first rotation fsyncs the checkpoint for papers 1+2; paper 3's
+    // write ticks the counter to 0 and exits before that shard rotates.
+    let status1 = std::process::Command::new(env!("CARGO_BIN_EXE_latex-extract"))
+        .args([
+            "-d", input_dir.path().to_str().unwrap(),
+            "-o", output_dir.path().to_str().unwrap(),
+            "--output-format", "parquet",
+            "--papers-per-shard", "2",
+            "-j", "1",
+            "--resume",
+        ])
+        .env("ARXIV_TEX_EXTRACT_KILL_AFTER_PAPERS", "3")
+        .status()
+        .unwrap();
+
+    assert!(
+        !status1.success(),
+        "run 1 should have been killed, got: {}",
+        status1
+    );
+    assert_eq!(status1.code(), Some(137), "expected exit 137");
+
+    // Expect at least one rotated parquet shard and a checkpoint with
+    // exactly 2 per-paper entries (not 3 — paper 3's shard never rotated).
+    let checkpoint_content =
+        fs::read_to_string(output_dir.path().join("checkpoint.log")).unwrap();
+    let paper_lines: Vec<&str> = checkpoint_content
+        .lines()
+        .filter(|l| l.contains('\t'))
+        .collect();
+    assert_eq!(
+        paper_lines.len(),
+        2,
+        "expected 2 per-paper checkpoint entries, got: {}",
+        checkpoint_content
+    );
+
+    let rotated_shards: Vec<_> = fs::read_dir(output_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "parquet"))
+        .collect();
+    assert!(
+        !rotated_shards.is_empty(),
+        "expected at least one rotated parquet shard"
+    );
+
+    // Run 2: resume without the kill hook. Should skip the 2 durable
+    // papers, re-extract the rest, and produce shards covering all 6 IDs.
+    let status2 = std::process::Command::new(env!("CARGO_BIN_EXE_latex-extract"))
+        .args([
+            "-d", input_dir.path().to_str().unwrap(),
+            "-o", output_dir.path().to_str().unwrap(),
+            "--output-format", "parquet",
+            "--papers-per-shard", "2",
+            "-j", "1",
+            "--resume",
+        ])
+        .status()
+        .unwrap();
+    assert!(status2.success(), "run 2 should succeed: {}", status2);
+
+    let final_ids = collect_all_arxiv_ids(output_dir.path());
+    // Every paper should appear exactly once, no duplicates.
+    let mut expected: Vec<String> = papers.iter().map(|(id, _)| id.clone()).collect();
+    expected.sort();
+    assert_eq!(
+        final_ids, expected,
+        "final shard set should equal the original 6 papers exactly once"
+    );
+    let deduped: std::collections::HashSet<_> = final_ids.iter().collect();
+    assert_eq!(
+        deduped.len(),
+        final_ids.len(),
+        "no paper should be duplicated across shards"
+    );
+
+    // No `.tmp` debris left behind.
+    for entry in fs::read_dir(output_dir.path()).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().to_string();
+        assert!(!name.ends_with(".tmp"), "stale tmp left: {name}");
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn test_kill_resume_round_trip_files_mode() {
+    let input_dir = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+
+    let papers = six_papers();
+    for (id, tex) in &papers {
+        create_test_gz(input_dir.path(), &format!("{}.gz", id), tex);
+    }
+
+    // Run 1: kill after 3 writes.
+    let status1 = std::process::Command::new(env!("CARGO_BIN_EXE_latex-extract"))
+        .args([
+            "-d", input_dir.path().to_str().unwrap(),
+            "-o", output_dir.path().to_str().unwrap(),
+            "--output-format", "parquet",
+            "--papers-per-shard", "2",
+            "-j", "1",
+            "--resume",
+        ])
+        .env("ARXIV_TEX_EXTRACT_KILL_AFTER_PAPERS", "3")
+        .status()
+        .unwrap();
+    assert!(!status1.success(), "run 1 should have been killed");
+    assert_eq!(status1.code(), Some(137));
+
+    let cp_path = output_dir.path().join("checkpoint.log");
+    let checkpoint_content = fs::read_to_string(&cp_path).unwrap_or_default();
+    let paper_lines: Vec<&str> = checkpoint_content
+        .lines()
+        .filter(|l| l.contains('\t'))
+        .collect();
+    // With -j 1 and papers_per_shard=2, at least one rotation fired and
+    // the checkpoint carries at least 2 per-paper entries.
+    assert!(
+        paper_lines.len() >= 2,
+        "expected ≥2 paper entries, got {} in: {}",
+        paper_lines.len(),
+        checkpoint_content
+    );
+
+    // Run 2: resume.
+    let status2 = std::process::Command::new(env!("CARGO_BIN_EXE_latex-extract"))
+        .args([
+            "-d", input_dir.path().to_str().unwrap(),
+            "-o", output_dir.path().to_str().unwrap(),
+            "--output-format", "parquet",
+            "--papers-per-shard", "2",
+            "-j", "1",
+            "--resume",
+        ])
+        .status()
+        .unwrap();
+    assert!(status2.success(), "run 2 should succeed: {}", status2);
+
+    let final_ids = collect_all_arxiv_ids(output_dir.path());
+    let mut expected: Vec<String> = papers.iter().map(|(id, _)| id.clone()).collect();
+    expected.sort();
+    assert_eq!(
+        final_ids, expected,
+        "final shard set should contain all 6 papers exactly once"
+    );
 }

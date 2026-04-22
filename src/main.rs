@@ -31,6 +31,52 @@ use latex_extract::result::ExtractionResult;
 /// Default maximum combined .tex content size (20MB).
 const DEFAULT_MAX_TEX_BYTES: usize = 20_000_000;
 
+/// Test-only hook: simulate a SIGKILL (jetsam / OOM) by calling
+/// `std::process::exit(137)` after `N` papers have been successfully
+/// written. Activated by the `ARXIV_TEX_EXTRACT_KILL_AFTER_PAPERS` env
+/// var when the `test-hooks` Cargo feature is enabled. Off in release.
+#[cfg(feature = "test-hooks")]
+mod test_hooks {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    /// `-1` means unarmed. Any non-negative value counts down per paper;
+    /// when `fetch_sub` returns `1` the process exits with code 137.
+    static COUNTDOWN: AtomicIsize = AtomicIsize::new(-1);
+
+    pub fn arm_from_env() {
+        if let Ok(s) = std::env::var("ARXIV_TEX_EXTRACT_KILL_AFTER_PAPERS") {
+            if let Ok(n) = s.parse::<isize>() {
+                if n > 0 {
+                    COUNTDOWN.store(n, Ordering::Relaxed);
+                    tracing::info!(
+                        "test-hooks: will exit(137) after {} successful paper writes",
+                        n
+                    );
+                }
+            }
+        }
+    }
+
+    /// Call after each successful paper write (in both tars-mode and
+    /// files-mode). When the countdown reaches zero, exit immediately.
+    pub fn tick() {
+        let prev = COUNTDOWN.fetch_sub(1, Ordering::Relaxed);
+        if prev == 1 {
+            // Exit *before* any subsequent shard rotation / fsync happens —
+            // the in-flight shard's rows and checkpoint entries are lost,
+            // which is the point of this simulation.
+            std::process::exit(137);
+        }
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+mod test_hooks {
+    pub fn arm_from_env() {}
+    #[inline(always)]
+    pub fn tick() {}
+}
+
 #[derive(Parser)]
 #[command(name = "latex-extract")]
 #[command(about = "Extract text from arXiv LaTeX source archives")]
@@ -159,6 +205,8 @@ fn log_memory_stats() {}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
+
+    test_hooks::arm_from_env();
 
     let args = Args::parse();
 
@@ -466,6 +514,9 @@ fn process_individual_archives(
 
     let (tx, rx) = mpsc::channel::<ExtractionResult>();
 
+    let parquet_start_idx = next_available_shard_index(output_dir, writer_stem, "parquet");
+    let jsonl_start_idx = next_available_shard_index(output_dir, writer_stem, "jsonl");
+
     let output_dir_owned = output_dir.to_path_buf();
     let io_errors_writer = io_errors.clone();
     let checkpoint_for_writer = checkpoint_path_for_writer.clone();
@@ -480,12 +531,16 @@ fn process_individual_archives(
                     max_shard_bytes,
                     papers_per_shard,
                 )
-                .with_checkpoint(checkpoint_for_writer.clone());
+                .with_checkpoint(checkpoint_for_writer.clone())
+                .with_starting_shard_index(parquet_start_idx);
                 for result in rx {
                     let id = result.arxiv_id.clone();
-                    if let Err(e) = writer.write(result) {
-                        error!(category = "io", "parquet write error: {}", e);
-                        io_errors_writer.lock().unwrap().record(Outcome::IoError, &id);
+                    match writer.write(result) {
+                        Ok(()) => test_hooks::tick(),
+                        Err(e) => {
+                            error!(category = "io", "parquet write error: {}", e);
+                            io_errors_writer.lock().unwrap().record(Outcome::IoError, &id);
+                        }
                     }
                 }
                 writer.finish()?;
@@ -496,12 +551,16 @@ fn process_individual_archives(
                     &writer_stem_owned,
                     papers_per_shard,
                 )
-                .with_checkpoint(checkpoint_for_writer.clone());
+                .with_checkpoint(checkpoint_for_writer.clone())
+                .with_starting_shard_index(jsonl_start_idx);
                 for result in rx {
                     let id = result.arxiv_id.clone();
-                    if let Err(e) = writer.write(&result) {
-                        error!(category = "io", "JSON write error: {}", e);
-                        io_errors_writer.lock().unwrap().record(Outcome::IoError, &id);
+                    match writer.write(&result) {
+                        Ok(()) => test_hooks::tick(),
+                        Err(e) => {
+                            error!(category = "io", "JSON write error: {}", e);
+                            io_errors_writer.lock().unwrap().record(Outcome::IoError, &id);
+                        }
                     }
                 }
                 writer.finish()?;
@@ -621,6 +680,34 @@ fn cleanup_stale_tmp_shards(output_dir: &Path, stem: &str) {
             let _ = fs::remove_file(entry.path());
         }
     }
+}
+
+/// Compute the first unused shard index for `{stem}.{ext}` / `{stem}_NNN.{ext}`
+/// files in `output_dir`. Used on `--resume` so a fresh writer doesn't
+/// overwrite prior-run shards sitting at index 0.
+fn next_available_shard_index(output_dir: &Path, stem: &str, ext: &str) -> usize {
+    let mut max_idx: Option<usize> = None;
+    let Ok(entries) = fs::read_dir(output_dir) else {
+        return 0;
+    };
+    let shard0 = format!("{}.{}", stem, ext);
+    let prefix = format!("{}_", stem);
+    let suffix = format!(".{}", ext);
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == shard0 {
+            max_idx = Some(max_idx.unwrap_or(0).max(0));
+            continue;
+        }
+        if let Some(rest) = name.strip_prefix(&prefix) {
+            if let Some(num_str) = rest.strip_suffix(&suffix) {
+                if let Ok(n) = num_str.parse::<usize>() {
+                    max_idx = Some(max_idx.unwrap_or(0).max(n));
+                }
+            }
+        }
+    }
+    max_idx.map(|n| n + 1).unwrap_or(0)
 }
 
 /// Derive output filename stem from a path, stripping double extensions.
@@ -868,6 +955,7 @@ fn process_outer_tar(
 
     match format {
         OutputFormat::Parquet => {
+            let start_idx = next_available_shard_index(output_dir, &stem, "parquet");
             let mut writer = ParquetShardWriter::new(
                 output_dir,
                 &stem,
@@ -875,7 +963,8 @@ fn process_outer_tar(
                 max_shard_bytes,
                 papers_per_shard,
             )
-            .with_checkpoint(checkpoint_path.clone());
+            .with_checkpoint(checkpoint_path.clone())
+            .with_starting_shard_index(start_idx);
 
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
@@ -885,9 +974,12 @@ fn process_outer_tar(
                         } else {
                             let result = extract_paper_with_trace(&paper, &source_tar, &stem, timeout, max_tex_bytes, max_memory_bytes, admission);
                             counts.record(classify_result(&result), &result.arxiv_id);
-                            if let Err(e) = writer.write(result) {
-                                error!(category = "io", tar = %stem, "parquet write error: {}", e);
-                                counts.record(Outcome::IoError, &paper.arxiv_id);
+                            match writer.write(result) {
+                                Ok(()) => test_hooks::tick(),
+                                Err(e) => {
+                                    error!(category = "io", tar = %stem, "parquet write error: {}", e);
+                                    counts.record(Outcome::IoError, &paper.arxiv_id);
+                                }
                             }
                         }
                     }
@@ -908,8 +1000,10 @@ fn process_outer_tar(
             }
         }
         OutputFormat::Jsonl => {
+            let start_idx = next_available_shard_index(output_dir, &stem, "jsonl");
             let mut writer = JsonlShardWriter::new(output_dir, &stem, papers_per_shard)
-                .with_checkpoint(checkpoint_path.clone());
+                .with_checkpoint(checkpoint_path.clone())
+                .with_starting_shard_index(start_idx);
 
             archive::for_each_paper(file, |paper_result| {
                 match paper_result {
@@ -919,9 +1013,12 @@ fn process_outer_tar(
                         } else {
                             let result = extract_paper_with_trace(&paper, &source_tar, &stem, timeout, max_tex_bytes, max_memory_bytes, admission);
                             counts.record(classify_result(&result), &result.arxiv_id);
-                            if let Err(e) = writer.write(&result) {
-                                error!(category = "io", tar = %stem, "JSON write error: {}", e);
-                                counts.record(Outcome::IoError, &paper.arxiv_id);
+                            match writer.write(&result) {
+                                Ok(()) => test_hooks::tick(),
+                                Err(e) => {
+                                    error!(category = "io", tar = %stem, "JSON write error: {}", e);
+                                    counts.record(Outcome::IoError, &paper.arxiv_id);
+                                }
                             }
                         }
                     }
