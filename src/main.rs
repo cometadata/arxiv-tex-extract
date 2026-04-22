@@ -133,6 +133,21 @@ fn log_memory_stats() {
     }
 }
 
+/// Current jemalloc resident bytes — closer to OS RSS than `allocated`
+/// because it includes pages held by arenas but not yet purged. Used for
+/// the backstop pressure-skip in `extract_with_timeout`.
+#[cfg(not(target_env = "msvc"))]
+fn get_resident_bytes() -> Option<usize> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    epoch::advance().ok()?;
+    stats::resident::read().ok()
+}
+
+#[cfg(target_env = "msvc")]
+fn get_resident_bytes() -> Option<usize> {
+    None
+}
+
 #[cfg(target_env = "msvc")]
 fn log_memory_stats() {}
 
@@ -721,6 +736,13 @@ fn process_outer_tar(
 
     let mut counts = StatusCounts::default();
 
+    // Purge jemalloc arenas every PURGE_INTERVAL papers inside a tar.
+    // A single large tar can have thousands of papers; waiting until tar
+    // boundary for the coarse purge lets per-arena caches accumulate
+    // multi-GB across a long tar.
+    const PURGE_INTERVAL: usize = 50;
+    let mut papers_since_purge = 0usize;
+
     match format {
         OutputFormat::Parquet => {
             let mut writer =
@@ -740,6 +762,11 @@ fn process_outer_tar(
                         error!(category = "archive", tar = %stem, "entry error: {}", e);
                         counts.record(Outcome::ArchiveError, "unknown");
                     }
+                }
+                papers_since_purge += 1;
+                if papers_since_purge >= PURGE_INTERVAL {
+                    latex_extract::memory::purge_jemalloc_arenas();
+                    papers_since_purge = 0;
                 }
             });
 
@@ -768,6 +795,11 @@ fn process_outer_tar(
                         error!(category = "archive", tar = %stem, "entry error: {}", e);
                         counts.record(Outcome::ArchiveError, "unknown");
                     }
+                }
+                papers_since_purge += 1;
+                if papers_since_purge >= PURGE_INTERVAL {
+                    latex_extract::memory::purge_jemalloc_arenas();
+                    papers_since_purge = 0;
                 }
             });
 
@@ -818,7 +850,7 @@ fn extract_with_timeout(
     source_tar: Option<&str>,
     timeout: Duration,
     max_tex_bytes: usize,
-    _max_memory_bytes: Option<usize>,
+    max_memory_bytes: Option<usize>,
     admission: &Arc<AdmissionControl>,
 ) -> ExtractionResult {
     let num_files = paper.tex_files.len();
@@ -851,11 +883,6 @@ fn extract_with_timeout(
         };
     }
 
-    // The old racy pre-spawn `get_allocated_bytes() > max_memory` check was
-    // replaced by the admission-control semaphore below: N parallel rayon
-    // workers could all pass the check simultaneously and collectively
-    // exceed the limit. The semaphore is authoritative.
-
     // Clone data for the spawned thread (thread::spawn requires 'static).
     // tex_files is an Arc<Vec<TexFile>>, so this is a refcount bump.
     let tex_files = Arc::clone(&paper.tex_files);
@@ -873,6 +900,50 @@ fn extract_with_timeout(
     // permit is moved into the closure so it lives exactly as long as the
     // extractor thread, including during cooperative cancellation.
     let permit = admission.acquire_owned();
+
+    // Post-admission RSS backstop. Admission control bounds concurrency,
+    // but cumulative jemalloc retention plus in-flight writer buffers
+    // can still push process RSS past `max_memory_bytes`. Checking *after*
+    // acquiring the permit means the read is serialised — no racing
+    // workers — so we can purge first and re-check before skipping. Most
+    // of the "pressure" comes from retained arena pages, not live
+    // allocations; a purge usually brings RSS back under the limit.
+    if let Some(max_memory) = max_memory_bytes {
+        if let Some(resident) = get_resident_bytes() {
+            if resident > max_memory {
+                latex_extract::memory::purge_jemalloc_arenas();
+                let after = get_resident_bytes().unwrap_or(resident);
+                if after > max_memory {
+                    warn!(
+                        category = "skipped",
+                        arxiv_id = %paper.arxiv_id,
+                        "memory pressure: {:.1}MB resident exceeds {:.1}MB limit (post-purge)",
+                        after as f64 / 1_048_576.0,
+                        max_memory as f64 / 1_048_576.0,
+                    );
+                    drop(permit);
+                    return ExtractionResult {
+                        arxiv_id: paper.arxiv_id.clone(),
+                        source_tar: source_tar.map(|s| s.to_string()),
+                        status: "skipped".into(),
+                        num_tex_files: Some(num_files),
+                        text_length: None,
+                        text: None,
+                        error: Some(format!(
+                            "memory pressure: {:.1}MB resident exceeds {:.1}MB limit",
+                            after as f64 / 1_048_576.0,
+                            max_memory as f64 / 1_048_576.0,
+                        )),
+                        stage_timings_us: None,
+                        total_time_us: None,
+                        peak_memory_bytes: None,
+                        file_type: Some(paper.file_type),
+                        entry_name: Some(paper.entry_name.clone()),
+                    };
+                }
+            }
+        }
+    }
 
     thread::spawn(move || {
         let _permit = permit;
