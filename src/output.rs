@@ -31,7 +31,18 @@ pub fn result_schema() -> Schema {
     ])
 }
 
+/// Rows per Arrow RecordBatch flushed to the Parquet writer within a shard.
+/// Keeping this small bounds transient memory from Arrow builder pre-allocation
+/// (`len * 4_000` bytes for the text column alone) so peak RSS during shard
+/// write is ~1 MB per flush instead of ~300 MB on a 10 k-row shard.
+const MICRO_BATCH_ROWS: usize = 256;
+
 /// Writes extraction results to parquet shards with automatic splitting.
+///
+/// Rows are buffered only up to `MICRO_BATCH_ROWS` in memory; each flush
+/// converts that micro-batch to an Arrow `RecordBatch` and hands it to the
+/// live `ArrowWriter` for the current shard. A new shard is started once
+/// `max_rows` or `max_bytes` is reached.
 pub struct ParquetShardWriter {
     schema: Arc<Schema>,
     output_dir: PathBuf,
@@ -39,9 +50,20 @@ pub struct ParquetShardWriter {
     shard_index: usize,
     max_rows: usize,
     max_bytes: usize,
-    buffer: Vec<ExtractionResult>,
-    current_bytes: usize,
+    /// Rows awaiting the next micro-batch flush.
+    micro_batch: Vec<ExtractionResult>,
+    /// Per-shard state; present while a shard is being written to.
+    shard: Option<ShardWriter>,
     completed_shards: Vec<PathBuf>,
+}
+
+struct ShardWriter {
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    writer: ArrowWriter<File>,
+    shard_id: String,
+    rows_written: usize,
+    bytes_estimate: usize,
 }
 
 impl ParquetShardWriter {
@@ -58,13 +80,14 @@ impl ParquetShardWriter {
             shard_index: 0,
             max_rows,
             max_bytes,
-            buffer: Vec::with_capacity(1024),
-            current_bytes: 0,
+            micro_batch: Vec::with_capacity(MICRO_BATCH_ROWS),
+            shard: None,
             completed_shards: Vec::new(),
         }
     }
 
-    /// Add a result to the buffer. Flushes to disk if limits are exceeded.
+    /// Add a result. Triggers a micro-batch flush every `MICRO_BATCH_ROWS`
+    /// and rotates to a new shard once `max_rows` / `max_bytes` is reached.
     pub fn write(&mut self, result: ExtractionResult) -> Result<()> {
         let byte_estimate = result.arxiv_id.len()
             + result.text.as_ref().map_or(0, |t| t.len())
@@ -72,31 +95,40 @@ impl ParquetShardWriter {
             + result.stage_timings_us.as_ref().map_or(0, |s| s.len())
             + 200;
 
-        self.buffer.push(result);
-        self.current_bytes += byte_estimate;
+        self.ensure_shard_open()?;
+        self.micro_batch.push(result);
+        {
+            let sw = self.shard.as_mut().expect("shard open");
+            sw.rows_written += 1;
+            sw.bytes_estimate += byte_estimate;
+        }
 
-        if self.buffer.len() >= self.max_rows || self.current_bytes >= self.max_bytes {
-            self.flush_shard()?;
+        if self.micro_batch.len() >= MICRO_BATCH_ROWS {
+            self.flush_micro_batch()?;
+        }
+
+        let (rows, bytes) = {
+            let sw = self.shard.as_ref().expect("shard open");
+            (sw.rows_written, sw.bytes_estimate)
+        };
+        if rows >= self.max_rows || bytes >= self.max_bytes {
+            self.close_shard()?;
         }
 
         Ok(())
     }
 
-    /// Flush current buffer to a parquet shard file.
-    fn flush_shard(&mut self) -> Result<()> {
-        if self.buffer.is_empty() {
+    fn ensure_shard_open(&mut self) -> Result<()> {
+        if self.shard.is_some() {
             return Ok(());
         }
-
         let shard_name = if self.shard_index == 0 {
             format!("{}.parquet", self.base_name)
         } else {
             format!("{}_{:03}.parquet", self.base_name, self.shard_index)
         };
-
         let final_path = self.output_dir.join(&shard_name);
         let temp_path = self.output_dir.join(format!(".{}.tmp", shard_name));
-
         let shard_id = if self.shard_index == 0 {
             self.base_name.clone()
         } else {
@@ -105,95 +137,130 @@ impl ParquetShardWriter {
 
         let file = File::create(&temp_path)
             .with_context(|| format!("creating temp file {}", temp_path.display()))?;
-
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
             .build();
+        let writer = ArrowWriter::try_new(file, self.schema.clone(), Some(props))?;
 
-        let mut writer = ArrowWriter::try_new(file, self.schema.clone(), Some(props))?;
-        let batch = self.build_record_batch(&shard_id)?;
-        writer.write(&batch)?;
-        writer.close()?;
-
-        fs::rename(&temp_path, &final_path).with_context(|| {
-            format!(
-                "renaming {} to {}",
-                temp_path.display(),
-                final_path.display()
-            )
-        })?;
-
-        self.completed_shards.push(final_path);
-        self.buffer.clear();
-        self.current_bytes = 0;
-        self.shard_index += 1;
-
+        self.shard = Some(ShardWriter {
+            final_path,
+            temp_path,
+            writer,
+            shard_id,
+            rows_written: 0,
+            bytes_estimate: 0,
+        });
         Ok(())
     }
 
-    /// Convert buffered results to an Arrow RecordBatch.
-    fn build_record_batch(&self, shard_id: &str) -> Result<RecordBatch> {
-        let len = self.buffer.len();
-
-        let mut arxiv_ids = StringBuilder::with_capacity(len, len * 20);
-        let mut statuses = StringBuilder::with_capacity(len, len * 8);
-        let mut error_messages = StringBuilder::with_capacity(len, len * 32);
-        let mut num_tex_files = UInt32Builder::with_capacity(len);
-        let mut text_lengths = UInt32Builder::with_capacity(len);
-        let mut texts = LargeStringBuilder::with_capacity(len, len * 30_000);
-        let mut stage_timings = StringBuilder::with_capacity(len, len * 200);
-        let mut total_times = UInt64Builder::with_capacity(len);
-        let mut peak_memories = UInt64Builder::with_capacity(len);
-        let mut outer_tars = StringBuilder::with_capacity(len, len * 20);
-        let mut file_types = StringBuilder::with_capacity(len, len * 10);
-        let mut entry_names = StringBuilder::with_capacity(len, len * 30);
-        let mut shard_ids = StringBuilder::with_capacity(len, len * 20);
-
-        for r in &self.buffer {
-            arxiv_ids.append_value(&r.arxiv_id);
-            statuses.append_value(&r.status);
-            append_option_str(&mut error_messages, r.error.as_deref());
-            append_option_u32(&mut num_tex_files, r.num_tex_files.map(|n| n as u32));
-            append_option_u32(&mut text_lengths, r.text_length.map(|n| n as u32));
-            append_option_large_str(&mut texts, r.text.as_deref());
-            append_option_str(&mut stage_timings, r.stage_timings_us.as_deref());
-            append_option_u64(&mut total_times, r.total_time_us);
-            append_option_u64(&mut peak_memories, r.peak_memory_bytes);
-            append_option_str(&mut outer_tars, r.source_tar.as_deref());
-            append_option_str(&mut file_types, r.file_type.map(|ft| ft.as_str()));
-            append_option_str(&mut entry_names, r.entry_name.as_deref());
-            shard_ids.append_value(shard_id);
+    fn flush_micro_batch(&mut self) -> Result<()> {
+        if self.micro_batch.is_empty() {
+            return Ok(());
         }
-
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(arxiv_ids.finish()),
-            Arc::new(statuses.finish()),
-            Arc::new(error_messages.finish()),
-            Arc::new(num_tex_files.finish()),
-            Arc::new(text_lengths.finish()),
-            Arc::new(texts.finish()),
-            Arc::new(stage_timings.finish()),
-            Arc::new(total_times.finish()),
-            Arc::new(peak_memories.finish()),
-            Arc::new(outer_tars.finish()),
-            Arc::new(file_types.finish()),
-            Arc::new(entry_names.finish()),
-            Arc::new(shard_ids.finish()),
-        ];
-
-        RecordBatch::try_new(self.schema.clone(), columns).context("building record batch")
+        let sw = self.shard.as_mut().expect("shard open");
+        let batch = build_record_batch(&self.schema, &self.micro_batch, &sw.shard_id)?;
+        sw.writer.write(&batch)?;
+        self.micro_batch.clear();
+        Ok(())
     }
 
-    /// Flush remaining buffer and return all completed shard paths.
+    fn close_shard(&mut self) -> Result<()> {
+        self.flush_micro_batch()?;
+        let sw = self.shard.take().expect("shard open");
+        sw.writer.close()?;
+        fs::rename(&sw.temp_path, &sw.final_path).with_context(|| {
+            format!(
+                "renaming {} to {}",
+                sw.temp_path.display(),
+                sw.final_path.display()
+            )
+        })?;
+        self.completed_shards.push(sw.final_path);
+        self.shard_index += 1;
+        Ok(())
+    }
+
+    /// Flush the trailing micro-batch and close the final shard.
     pub fn finish(mut self) -> Result<Vec<PathBuf>> {
-        self.flush_shard()?;
+        if self.shard.is_some() {
+            self.close_shard()?;
+        }
         Ok(self.completed_shards)
     }
 
-    /// Number of rows written so far (across all shards + current buffer).
+    /// Number of rows written across all shards so far. Useful for telemetry.
     pub fn rows_written(&self) -> usize {
-        self.completed_shards.len() * self.max_rows + self.buffer.len()
+        let current = self.shard.as_ref().map_or(0, |sw| sw.rows_written);
+        self.completed_shards.len() * self.max_rows + current
     }
+
+    /// Rows pending in the current micro-batch (not yet handed to Arrow).
+    /// Exposed for test-assertion of streaming behaviour.
+    pub fn micro_buffer_len(&self) -> usize {
+        self.micro_batch.len()
+    }
+}
+
+/// Build an Arrow `RecordBatch` from a slice of rows.
+///
+/// Capacity hints are sized for a micro-batch (≤ 256 rows): the text column
+/// hint is `len * 4_000` bytes, ~1 MB upfront on a full micro-batch instead
+/// of the previous `len * 30_000` which materialised ~300 MB on a 10 k-row
+/// full-shard flush.
+fn build_record_batch(
+    schema: &Arc<Schema>,
+    rows: &[ExtractionResult],
+    shard_id: &str,
+) -> Result<RecordBatch> {
+    let len = rows.len();
+
+    let mut arxiv_ids = StringBuilder::with_capacity(len, len * 20);
+    let mut statuses = StringBuilder::with_capacity(len, len * 8);
+    let mut error_messages = StringBuilder::with_capacity(len, len * 32);
+    let mut num_tex_files = UInt32Builder::with_capacity(len);
+    let mut text_lengths = UInt32Builder::with_capacity(len);
+    let mut texts = LargeStringBuilder::with_capacity(len, len * 4_000);
+    let mut stage_timings = StringBuilder::with_capacity(len, len * 200);
+    let mut total_times = UInt64Builder::with_capacity(len);
+    let mut peak_memories = UInt64Builder::with_capacity(len);
+    let mut outer_tars = StringBuilder::with_capacity(len, len * 20);
+    let mut file_types = StringBuilder::with_capacity(len, len * 10);
+    let mut entry_names = StringBuilder::with_capacity(len, len * 30);
+    let mut shard_ids = StringBuilder::with_capacity(len, len * 20);
+
+    for r in rows {
+        arxiv_ids.append_value(&r.arxiv_id);
+        statuses.append_value(&r.status);
+        append_option_str(&mut error_messages, r.error.as_deref());
+        append_option_u32(&mut num_tex_files, r.num_tex_files.map(|n| n as u32));
+        append_option_u32(&mut text_lengths, r.text_length.map(|n| n as u32));
+        append_option_large_str(&mut texts, r.text.as_deref());
+        append_option_str(&mut stage_timings, r.stage_timings_us.as_deref());
+        append_option_u64(&mut total_times, r.total_time_us);
+        append_option_u64(&mut peak_memories, r.peak_memory_bytes);
+        append_option_str(&mut outer_tars, r.source_tar.as_deref());
+        append_option_str(&mut file_types, r.file_type.map(|ft| ft.as_str()));
+        append_option_str(&mut entry_names, r.entry_name.as_deref());
+        shard_ids.append_value(shard_id);
+    }
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(arxiv_ids.finish()),
+        Arc::new(statuses.finish()),
+        Arc::new(error_messages.finish()),
+        Arc::new(num_tex_files.finish()),
+        Arc::new(text_lengths.finish()),
+        Arc::new(texts.finish()),
+        Arc::new(stage_timings.finish()),
+        Arc::new(total_times.finish()),
+        Arc::new(peak_memories.finish()),
+        Arc::new(outer_tars.finish()),
+        Arc::new(file_types.finish()),
+        Arc::new(entry_names.finish()),
+        Arc::new(shard_ids.finish()),
+    ];
+
+    RecordBatch::try_new(schema.clone(), columns).context("building record batch")
 }
 
 fn append_option_str(builder: &mut StringBuilder, val: Option<&str>) {
@@ -331,5 +398,35 @@ mod tests {
     fn test_schema_field_count() {
         let schema = result_schema();
         assert_eq!(schema.fields().len(), 13);
+    }
+
+    #[test]
+    fn writer_flushes_incrementally_within_shard() {
+        // With a 256-row micro-batch and a 5000-row shard, writing 300 rows
+        // must flush at least one micro-batch — so the in-memory buffer
+        // is < MICRO_BATCH_ROWS.
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = ParquetShardWriter::new(dir.path(), "mb", 5000, usize::MAX);
+        for i in 0..300 {
+            writer.write(make_result(&format!("id{i:03}"), "text")).unwrap();
+        }
+        assert!(
+            writer.micro_buffer_len() < 256,
+            "expected micro-buffer < 256, was {}",
+            writer.micro_buffer_len()
+        );
+        let shards = writer.finish().unwrap();
+        // Single shard produced — we didn't cross 5000 rows.
+        assert_eq!(shards.len(), 1);
+
+        // Read back and confirm all 300 rows landed.
+        let file = File::open(&shards[0]).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 300);
     }
 }
