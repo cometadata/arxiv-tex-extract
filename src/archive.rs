@@ -75,12 +75,19 @@ fn classify_gz(raw: &[u8], arxiv_id: &str) -> (Vec<TexFile>, FileType) {
 /// Unlike `iter_papers()`, this keeps only one `PaperArchive` in memory
 /// at a time. Each paper is fully processed (via the callback `f`) before
 /// the next entry is read from the tar archive.
-pub fn for_each_paper(reader: impl Read, mut f: impl FnMut(Result<PaperArchive>)) {
+pub fn for_each_paper(
+    reader: impl Read,
+    mut f: impl FnMut(String, String, Result<PaperArchive>),
+) {
     let mut archive = tar::Archive::new(reader);
     let entries = match archive.entries() {
         Ok(e) => e,
         Err(e) => {
-            f(Err(anyhow::anyhow!("failed to read tar entries: {}", e)));
+            f(
+                "unknown".into(),
+                "unknown".into(),
+                Err(anyhow::anyhow!("failed to read tar entries: {}", e)),
+            );
             return;
         }
     };
@@ -89,7 +96,11 @@ pub fn for_each_paper(reader: impl Read, mut f: impl FnMut(Result<PaperArchive>)
         let entry = match entry_result {
             Ok(e) => e,
             Err(e) => {
-                f(Err(anyhow::anyhow!("tar entry error: {}", e)));
+                f(
+                    "unknown".into(),
+                    "unknown".into(),
+                    Err(anyhow::anyhow!("tar entry error: {}", e)),
+                );
                 continue;
             }
         };
@@ -106,7 +117,24 @@ pub fn for_each_paper(reader: impl Read, mut f: impl FnMut(Result<PaperArchive>)
         }
 
         let arxiv_id = derive_arxiv_id(&path);
-        f(process_entry(entry, &arxiv_id, &path));
+        f(
+            arxiv_id.clone(),
+            path.clone(),
+            process_entry(entry, &arxiv_id, &path),
+        );
+    }
+}
+
+/// Best-effort file type derived purely from a filename extension, for
+/// cases where content wasn't inspected (e.g. archive-load failures).
+/// Use `detect_file_type` on decompressed bytes when you have them.
+pub fn classify_by_extension(path: &str) -> FileType {
+    if path.ends_with(".pdf") {
+        FileType::Pdf
+    } else if path.ends_with(".tex") {
+        FileType::Tex
+    } else {
+        FileType::Unknown
     }
 }
 
@@ -116,7 +144,7 @@ pub fn for_each_paper(reader: impl Read, mut f: impl FnMut(Result<PaperArchive>)
 /// all results is acceptable (testing, small archives).
 pub fn iter_papers(reader: impl Read) -> Vec<Result<PaperArchive>> {
     let mut results = Vec::new();
-    for_each_paper(reader, |result| results.push(result));
+    for_each_paper(reader, |_id, _name, result| results.push(result));
     results
 }
 
@@ -405,5 +433,53 @@ mod tests {
         };
         let p2_files = Arc::clone(&p.tex_files);
         assert!(Arc::ptr_eq(&p.tex_files, &p2_files));
+    }
+
+    #[test]
+    fn test_for_each_paper_passes_arxiv_id_on_error() {
+        // Build an in-memory tar with a single entry whose header claims a
+        // size that exceeds MAX_DECOMPRESSED_SIZE (100 MB). `process_entry`
+        // bails on the size check, so `for_each_paper` yields `Err` for
+        // this entry — and must pass the derived arxiv_id alongside it.
+        let buf: Vec<u8> = Vec::new();
+        let mut tar_builder = tar::Builder::new(buf);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(200_000_000);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let empty: &[u8] = &[];
+        tar_builder
+            .append_data(&mut header, "2401.99999.gz", empty)
+            .unwrap();
+        let tar_bytes = tar_builder.into_inner().unwrap();
+
+        let mut observed: Vec<(String, String, Result<PaperArchive>)> = Vec::new();
+        for_each_paper(&tar_bytes[..], |id, name, r| observed.push((id, name, r)));
+
+        let (id, name, result) = observed
+            .into_iter()
+            .find(|(_, _, r)| r.is_err())
+            .expect("expected an Err from the oversized entry");
+        assert_eq!(id, "2401.99999");
+        assert_eq!(name, "2401.99999.gz");
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => unreachable!(),
+        };
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("100MB limit"),
+            "error should reference the 100MB limit, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_classify_by_extension() {
+        assert_eq!(classify_by_extension("2401.00001.pdf"), FileType::Pdf);
+        assert_eq!(classify_by_extension("2401.00001.tex"), FileType::Tex);
+        assert_eq!(classify_by_extension("2401.00001.gz"), FileType::Unknown);
+        assert_eq!(classify_by_extension("2401.00001.tar.gz"), FileType::Unknown);
+        assert_eq!(classify_by_extension("no_extension"), FileType::Unknown);
     }
 }

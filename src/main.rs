@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 
 use latex_extract::admission::AdmissionControl;
-use latex_extract::archive::{self, PaperArchive};
+use latex_extract::archive::{self, classify_by_extension, PaperArchive};
 use latex_extract::checkpoint;
 use latex_extract::metrics::{self, Outcome, StatusCounts, TarMetrics};
 use latex_extract::output::{JsonlShardWriter, ParquetShardWriter};
@@ -876,7 +876,7 @@ fn process_outer_tar_text(
     let file = File::open(tar_path)?;
     let mut counts = StatusCounts::default();
 
-    archive::for_each_paper(file, |paper_result| {
+    archive::for_each_paper(file, |arxiv_id, entry_name, paper_result| {
         match paper_result {
             Ok(paper) => {
                 let result = extract_paper_with_trace(&paper, &source_tar, &stem, timeout, max_tex_bytes, max_memory_bytes, admission);
@@ -892,8 +892,8 @@ fn process_outer_tar_text(
                 counts.record(outcome, &result.arxiv_id);
             }
             Err(e) => {
-                error!(category = "archive", tar = %stem, "entry error: {}", e);
-                counts.record(Outcome::ArchiveError, "unknown");
+                error!(category = "archive", tar = %stem, arxiv_id = %arxiv_id, entry_name = %entry_name, "entry error: {}", e);
+                counts.record(Outcome::ArchiveError, &arxiv_id);
             }
         }
     });
@@ -966,7 +966,7 @@ fn process_outer_tar(
             .with_checkpoint(checkpoint_path.clone())
             .with_starting_shard_index(start_idx);
 
-            archive::for_each_paper(file, |paper_result| {
+            archive::for_each_paper(file, |arxiv_id, entry_name, paper_result| {
                 match paper_result {
                     Ok(paper) => {
                         if resume_papers.contains(&(stem.clone(), paper.arxiv_id.clone())) {
@@ -984,8 +984,13 @@ fn process_outer_tar(
                         }
                     }
                     Err(e) => {
-                        error!(category = "archive", tar = %stem, "entry error: {}", e);
-                        counts.record(Outcome::ArchiveError, "unknown");
+                        error!(category = "archive", tar = %stem, arxiv_id = %arxiv_id, entry_name = %entry_name, "entry error: {}", e);
+                        counts.record(Outcome::ArchiveError, &arxiv_id);
+                        if let Some(err_result) = build_archive_error_result(arxiv_id, entry_name, &source_tar, &e) {
+                            if let Err(e) = writer.write(err_result) {
+                                error!(category = "io", tar = %stem, "parquet write error: {}", e);
+                            }
+                        }
                     }
                 }
                 papers_since_purge += 1;
@@ -1005,7 +1010,7 @@ fn process_outer_tar(
                 .with_checkpoint(checkpoint_path.clone())
                 .with_starting_shard_index(start_idx);
 
-            archive::for_each_paper(file, |paper_result| {
+            archive::for_each_paper(file, |arxiv_id, entry_name, paper_result| {
                 match paper_result {
                     Ok(paper) => {
                         if resume_papers.contains(&(stem.clone(), paper.arxiv_id.clone())) {
@@ -1023,8 +1028,13 @@ fn process_outer_tar(
                         }
                     }
                     Err(e) => {
-                        error!(category = "archive", tar = %stem, "entry error: {}", e);
-                        counts.record(Outcome::ArchiveError, "unknown");
+                        error!(category = "archive", tar = %stem, arxiv_id = %arxiv_id, entry_name = %entry_name, "entry error: {}", e);
+                        counts.record(Outcome::ArchiveError, &arxiv_id);
+                        if let Some(err_result) = build_archive_error_result(arxiv_id, entry_name, &source_tar, &e) {
+                            if let Err(e) = writer.write(&err_result) {
+                                error!(category = "io", tar = %stem, "JSON write error: {}", e);
+                            }
+                        }
                     }
                 }
                 papers_since_purge += 1;
@@ -1049,6 +1059,31 @@ fn process_outer_tar(
     }
 
     Ok(counts)
+}
+
+/// Build an archive-error ExtractionResult for an outer-tar entry whose
+/// path was successfully derived but which failed to load (e.g. oversized
+/// header, mid-read I/O error). Returns `None` for tar-level failures
+/// where no entry path was available — those aren't persisted to the
+/// output because there is nothing identifying to record.
+fn build_archive_error_result(
+    arxiv_id: String,
+    entry_name: String,
+    source_tar: &str,
+    err: &anyhow::Error,
+) -> Option<ExtractionResult> {
+    if entry_name == "unknown" {
+        return None;
+    }
+    let mut result = ExtractionResult::error(
+        arxiv_id,
+        Some(source_tar.to_string()),
+        "archive_error",
+        format!("{}", err),
+    );
+    result.file_type = Some(classify_by_extension(&entry_name));
+    result.entry_name = Some(entry_name);
+    Some(result)
 }
 
 /// Classify an ExtractionResult into an Outcome.
