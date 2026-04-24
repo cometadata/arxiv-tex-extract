@@ -46,6 +46,62 @@ fn create_test_tar_with_papers(
     tar_path
 }
 
+/// Helper: create a tar containing valid .gz papers plus one malformed entry
+/// whose tar header claims a size larger than the `MAX_DECOMPRESSED_SIZE`
+/// limit in `src/archive.rs`. The bad entry trips the size guard inside
+/// `process_entry`, so `for_each_paper` yields `Err` for that entry.
+/// The bad entry's filename is `{bad_arxiv_id}.{bad_extension}`, letting
+/// tests exercise extension-based file_type classification.
+fn create_test_tar_with_oversized_entry(
+    dir: &Path,
+    name: &str,
+    good_papers: &[(&str, &str)],
+    bad_arxiv_id: &str,
+    bad_extension: &str,
+) -> std::path::PathBuf {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let tar_path = dir.join(name);
+    let tar_file = fs::File::create(&tar_path).unwrap();
+    let mut tar_builder = tar::Builder::new(tar_file);
+
+    for (arxiv_id, tex_content) in good_papers {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(tex_content.as_bytes()).unwrap();
+        let gz_bytes = gz.finish().unwrap();
+
+        let gz_name = format!("{}.gz", arxiv_id);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(gz_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder
+            .append_data(&mut header, &gz_name, &gz_bytes[..])
+            .unwrap();
+    }
+
+    // Bad entry: claim 200 MB in the header, attach an empty body. The
+    // `tar` crate writes the 512-byte header verbatim and zero-pads the
+    // body; on read, `process_entry` reads `header.size()` and bails
+    // before touching any of the body bytes.
+    let mut bad_header = tar::Header::new_gnu();
+    bad_header.set_size(200_000_000);
+    bad_header.set_mode(0o644);
+    bad_header.set_cksum();
+    let empty: &[u8] = &[];
+    tar_builder
+        .append_data(
+            &mut bad_header,
+            format!("{}.{}", bad_arxiv_id, bad_extension),
+            empty,
+        )
+        .unwrap();
+
+    tar_builder.finish().unwrap();
+    tar_path
+}
+
 #[test]
 fn test_parquet_output_end_to_end() {
     let input_dir = tempfile::tempdir().unwrap();
@@ -510,4 +566,173 @@ fn test_kill_resume_round_trip_files_mode() {
         final_ids, expected,
         "final shard set should contain all 6 papers exactly once"
     );
+}
+
+/// (arxiv_id, status, error, file_type, entry_name). Column indices come
+/// from `result_schema()` in src/output.rs — 0, 1, 2, 10, 11.
+type ParquetRow = (String, String, Option<String>, Option<String>, Option<String>);
+
+fn read_parquet_rows(path: &Path) -> Vec<ParquetRow> {
+    let file = fs::File::open(path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+    let batches: Vec<_> = reader.collect::<Result<_, _>>().unwrap();
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let statuses = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let errors = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let file_types = batch.column(10).as_any().downcast_ref::<StringArray>().unwrap();
+        let entry_names = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..batch.num_rows() {
+            let opt = |arr: &StringArray, i: usize| {
+                if arr.is_null(i) { None } else { Some(arr.value(i).to_string()) }
+            };
+            rows.push((
+                ids.value(i).to_string(),
+                statuses.value(i).to_string(),
+                opt(errors, i),
+                opt(file_types, i),
+                opt(entry_names, i),
+            ));
+        }
+    }
+    rows
+}
+
+#[test]
+fn test_parquet_archive_error_row_written() {
+    let input_dir = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+
+    let tex = r"\documentclass{article}\begin{document}Good paper.\end{document}";
+    create_test_tar_with_oversized_entry(
+        input_dir.path(),
+        "mixed_batch.tar",
+        &[("2401.00001", tex)],
+        "2401.99999",
+        "gz",
+    );
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_latex-extract"))
+        .args([
+            "-d", input_dir.path().to_str().unwrap(),
+            "-o", output_dir.path().to_str().unwrap(),
+            "--output-format", "parquet",
+            "--resume",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "binary exited with: {}", status);
+
+    let parquet_path = output_dir.path().join("mixed_batch.parquet");
+    assert!(parquet_path.exists(), "parquet file should exist");
+
+    let rows = read_parquet_rows(&parquet_path);
+    assert_eq!(rows.len(), 2, "expected exactly one good + one entry-error row");
+
+    let ok_row = rows.iter().find(|r| r.0 == "2401.00001").expect("good paper row missing");
+    assert_eq!(ok_row.1, "ok", "good paper should have status=ok");
+
+    let err_row = rows.iter().find(|r| r.0 == "2401.99999").expect("bad entry row missing");
+    assert_eq!(err_row.1, "archive_error");
+    assert!(err_row.2.as_deref().unwrap_or("").contains("100MB limit"));
+    assert_eq!(err_row.3.as_deref(), Some("unknown"), ".gz extension has no content inspection → Unknown");
+    assert_eq!(err_row.4.as_deref(), Some("2401.99999.gz"));
+
+    // The per-paper checkpoint is only emitted when --papers-per-shard is
+    // set, so here we only assert the tar-level entry.
+    let checkpoint = fs::read_to_string(output_dir.path().join("checkpoint.log")).unwrap();
+    assert!(checkpoint.contains("mixed_batch.tar"));
+}
+
+/// Run the "oversized {ext} entry yields an archive_error row with
+/// file_type={ext}" check end-to-end.
+fn run_extension_file_type_case(ext: &str) {
+    let input_dir = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+    let tar_stem = format!("{}_batch", ext);
+
+    let tex = r"\documentclass{article}\begin{document}Good paper.\end{document}";
+    create_test_tar_with_oversized_entry(
+        input_dir.path(),
+        &format!("{}.tar", tar_stem),
+        &[("2401.00001", tex)],
+        "2401.99999",
+        ext,
+    );
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_latex-extract"))
+        .args([
+            "-d", input_dir.path().to_str().unwrap(),
+            "-o", output_dir.path().to_str().unwrap(),
+            "--output-format", "parquet",
+            "--resume",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "binary exited with: {}", status);
+
+    let rows = read_parquet_rows(&output_dir.path().join(format!("{}.parquet", tar_stem)));
+    let err_row = rows.iter().find(|r| r.0 == "2401.99999")
+        .unwrap_or_else(|| panic!("bad .{} row missing", ext));
+    assert_eq!(err_row.1, "archive_error");
+    assert_eq!(err_row.3.as_deref(), Some(ext));
+    assert_eq!(err_row.4.as_deref(), Some(format!("2401.99999.{}", ext).as_str()));
+}
+
+#[test]
+fn test_parquet_archive_error_pdf_entry_has_file_type() {
+    run_extension_file_type_case("pdf");
+}
+
+#[test]
+fn test_parquet_archive_error_tex_entry_has_file_type() {
+    run_extension_file_type_case("tex");
+}
+
+#[test]
+fn test_jsonl_archive_error_row_written() {
+    let input_dir = tempfile::tempdir().unwrap();
+    let output_dir = tempfile::tempdir().unwrap();
+
+    let tex = r"\documentclass{article}\begin{document}Good paper.\end{document}";
+    create_test_tar_with_oversized_entry(
+        input_dir.path(),
+        "mixed_batch.tar",
+        &[("2401.00001", tex)],
+        "2401.99999",
+        "gz",
+    );
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_latex-extract"))
+        .args([
+            "-d", input_dir.path().to_str().unwrap(),
+            "-o", output_dir.path().to_str().unwrap(),
+            "--output-format", "jsonl",
+            "--resume",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "binary exited with: {}", status);
+
+    let jsonl_path = output_dir.path().join("mixed_batch.jsonl");
+    assert!(jsonl_path.exists(), "jsonl file should exist");
+
+    let content = fs::read_to_string(&jsonl_path).unwrap();
+    let rows: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("valid json line"))
+        .collect();
+    assert_eq!(rows.len(), 2, "expected exactly one good + one entry-error row");
+
+    let ok_row = rows.iter().find(|r| r["arxiv_id"] == "2401.00001").expect("good paper row missing");
+    assert_eq!(ok_row["status"], "ok");
+
+    let err_row = rows.iter().find(|r| r["arxiv_id"] == "2401.99999").expect("bad entry row missing");
+    assert_eq!(err_row["status"], "archive_error");
+    assert!(err_row["error"].as_str().unwrap_or("").contains("100MB limit"));
+    assert_eq!(err_row["file_type"], "unknown");
+    assert_eq!(err_row["entry_name"], "2401.99999.gz");
 }
