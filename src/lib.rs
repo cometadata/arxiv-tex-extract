@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod archive;
 pub mod braces;
 pub mod checkpoint;
@@ -8,6 +9,7 @@ pub mod environments;
 pub mod formatting;
 pub mod input_resolve;
 pub mod macros;
+pub mod memory;
 pub mod metrics;
 pub mod output;
 pub mod pipeline;

@@ -5,8 +5,9 @@ use crate::environments::convert_environments;
 use crate::formatting::convert_formatting;
 use crate::input_resolve::{resolve_and_order, TexFile};
 use crate::macros::{
-    collect_macros, collect_newtheorems, collect_parametric_macros, expand_macros,
-    expand_parametric_macros, normalize_shorthands, ParametricMacro,
+    collect_macros, collect_newtheorems, collect_parametric_macros,
+    expand_macros_cancellable, expand_parametric_macros_cancellable,
+    normalize_shorthands, ParametricMacro,
 };
 use crate::preamble::extract_body;
 use crate::references::convert_references;
@@ -15,6 +16,7 @@ use crate::symbols::convert_symbols;
 use crate::timing::StageTimings;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// State threaded through the pipeline to share data between stages.
 pub struct PipelineContext {
@@ -40,6 +42,16 @@ pub fn extract_text(tex_files: &[TexFile]) -> Option<String> {
 
 /// Run the full extraction pipeline, returning both text and per-stage timings.
 pub fn extract_text_timed(tex_files: &[TexFile]) -> ExtractionOutput {
+    extract_text_timed_cancellable(tex_files, None)
+}
+
+/// Cancellable variant of [`extract_text_timed`]. When `cancel` flips to
+/// `true`, the pipeline stops between files and macro-expansion passes
+/// and returns whatever it has produced so far.
+pub fn extract_text_timed_cancellable(
+    tex_files: &[TexFile],
+    cancel: Option<&AtomicBool>,
+) -> ExtractionOutput {
     if tex_files.is_empty() {
         return ExtractionOutput {
             text: None,
@@ -54,6 +66,11 @@ pub fn extract_text_timed(tex_files: &[TexFile]) -> ExtractionOutput {
         section_label_map: HashMap::new(),
     };
     for f in tex_files {
+        if let Some(c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                return ExtractionOutput { text: None, timings: StageTimings::new() };
+            }
+        }
         ctx.macros.extend(collect_macros(&f.content));
         ctx.parametric_macros
             .extend(collect_parametric_macros(&f.content));
@@ -66,7 +83,12 @@ pub fn extract_text_timed(tex_files: &[TexFile]) -> ExtractionOutput {
 
     let mut parts = Vec::new();
     for file in &ordered_files {
-        match clean_tex_file(&file.content, &mut ctx, &mut timings) {
+        if let Some(c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        match clean_tex_file(&file.content, &mut ctx, &mut timings, cancel) {
             Some(cleaned) if !cleaned.is_empty() => parts.push(cleaned),
             _ => {}
         }
@@ -97,6 +119,7 @@ fn clean_tex_file(
     file_content: &str,
     ctx: &mut PipelineContext,
     timings: &mut StageTimings,
+    cancel: Option<&AtomicBool>,
 ) -> Option<String> {
     let (preamble_extras, body) = extract_body(file_content);
 
@@ -108,10 +131,15 @@ fn clean_tex_file(
 
     body = timings.time("remove_comments", || remove_comments(&body));
     body = timings.time("normalize_shorthands", || normalize_shorthands(&body));
-    body = timings.time("expand_macros", || expand_macros(&body, &ctx.macros));
-    body = timings.time("expand_parametric", || {
-        expand_parametric_macros(&body, &ctx.parametric_macros)
+    body = timings.time("expand_macros", || {
+        expand_macros_cancellable(&body, &ctx.macros, cancel)
     });
+    body = timings.time("expand_parametric", || {
+        expand_parametric_macros_cancellable(&body, &ctx.parametric_macros, cancel)
+    });
+    if let Some(c) = cancel {
+        if c.load(Ordering::Relaxed) { return None; }
+    }
     body = timings.time("convert_structure", || {
         convert_structure(&body, &mut ctx.section_label_map)
     });

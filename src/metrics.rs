@@ -18,6 +18,10 @@ pub enum Outcome {
     Empty,
     /// Combined .tex content exceeds size limit
     Skipped,
+    /// Skipped on `--resume` because the paper is already in a durable shard.
+    /// Distinct from `Skipped` (which is a size-cap reject) so resume behaviour
+    /// doesn't inflate the "skipped due to size" category in telemetry.
+    SkippedResume,
     /// Per-document extraction timeout
     Timeout,
     /// Extraction pipeline panicked (catch_unwind)
@@ -61,6 +65,7 @@ pub struct StatusCounts {
     pub ok: u64,
     pub empty: CategoryDetail,
     pub skipped: CategoryDetail,
+    pub skipped_resume: CategoryDetail,
     pub timeouts: CategoryDetail,
     pub panics: CategoryDetail,
     pub crashes: CategoryDetail,
@@ -75,6 +80,7 @@ impl StatusCounts {
             Outcome::Ok => self.ok += 1,
             Outcome::Empty => self.empty.record(id),
             Outcome::Skipped => self.skipped.record(id),
+            Outcome::SkippedResume => self.skipped_resume.record(id),
             Outcome::Timeout => self.timeouts.record(id),
             Outcome::Panic => self.panics.record(id),
             Outcome::Crash => self.crashes.record(id),
@@ -88,6 +94,7 @@ impl StatusCounts {
         self.ok += other.ok;
         self.empty.merge(&other.empty);
         self.skipped.merge(&other.skipped);
+        self.skipped_resume.merge(&other.skipped_resume);
         self.timeouts.merge(&other.timeouts);
         self.panics.merge(&other.panics);
         self.crashes.merge(&other.crashes);
@@ -100,6 +107,7 @@ impl StatusCounts {
         self.ok
             + self.empty.count
             + self.skipped.count
+            + self.skipped_resume.count
             + self.timeouts.count
             + self.panics.count
             + self.crashes.count
@@ -111,6 +119,7 @@ impl StatusCounts {
         info!("{} ({} ok)", prefix, self.ok);
         log_category("timeouts", &self.timeouts);
         log_category("skipped", &self.skipped);
+        log_category("skipped (resume)", &self.skipped_resume);
         log_category("panics", &self.panics);
         log_category("archive errors", &self.archive_errors);
         log_category("empty", &self.empty);
@@ -144,6 +153,7 @@ pub struct TarMetrics {
     pub ok: u64,
     pub empty: u64,
     pub skipped: u64,
+    pub skipped_resume: u64,
     pub timeouts: u64,
     pub panics: u64,
     pub crashes: u64,
@@ -161,6 +171,7 @@ impl TarMetrics {
             ok: counts.ok,
             empty: counts.empty.count,
             skipped: counts.skipped.count,
+            skipped_resume: counts.skipped_resume.count,
             timeouts: counts.timeouts.count,
             panics: counts.panics.count,
             crashes: counts.crashes.count,
@@ -197,6 +208,7 @@ mod tests {
             ok: 90,
             empty: 2,
             skipped: 1,
+            skipped_resume: 0,
             timeouts: 2,
             panics: 3,
             crashes: 1,

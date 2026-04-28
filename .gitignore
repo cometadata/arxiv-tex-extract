@@ -1,3 +1,4 @@
 /target/
 /rust_output/
 .DS_Store
+.idea

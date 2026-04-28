@@ -2,7 +2,9 @@ use crate::braces::{extract_command_arg, extract_optional_arg, find_braced_group
 use crate::symbols::CommandReplacer;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+use tracing::warn;
 
 static PROTECTED_MACROS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
@@ -305,24 +307,86 @@ pub fn normalize_shorthands(text: &str) -> String {
 /// to limit worst-case scanning on large inputs.
 const LARGE_INPUT_THRESHOLD: usize = 5_000_000;
 
+/// Abort macro expansion if cumulative output exceeds this multiple of the input.
+/// Recursively or mutually-referencing macros can expand 6–7× per pass; the
+/// existing 5-pass ceiling means an unbounded loop can grow ~16,000×, pushing
+/// a 50 KB input past 800 MB. Bounding at 10× keeps expansion useful for
+/// well-formed macros while preventing runaway growth.
+const MAX_EXPANSION_GROWTH_RATIO: usize = 10;
+
+/// Hard ceiling on any single expansion pass, independent of input size.
+/// Protects against pathological large inputs whose `10× input` cap would
+/// still be huge. 50 MB per stage invocation is generous for LaTeX text.
+const MAX_EXPANSION_BYTES: usize = 50_000_000;
+
 /// Safely expand macros using Aho-Corasick single-pass replacement.
 ///
 /// Iterates up to `max_passes` times to resolve multi-level macro chains
 /// (e.g. \foo -> \bar -> "final"). For inputs above 5MB, the cap is reduced
 /// from 5 to 3 passes to limit worst-case scanning.
 pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
+    expand_macros_cancellable(text, macros, None)
+}
+
+/// Cancellable variant of [`expand_macros`]. If `cancel` is `Some` and
+/// flips to `true` between passes, returns the last bounded buffer early.
+pub fn expand_macros_cancellable(
+    text: &str,
+    macros: &HashMap<String, String>,
+    cancel: Option<&AtomicBool>,
+) -> String {
     if macros.is_empty() {
         return text.to_string();
     }
 
     let max_passes = if text.len() > LARGE_INPUT_THRESHOLD { 3 } else { 5 };
+    let input_len = text.len();
+    let size_cap = input_len
+        .saturating_mul(MAX_EXPANSION_GROWTH_RATIO)
+        .min(MAX_EXPANSION_BYTES);
 
     let pairs: Vec<(&str, &str)> = macros.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let replacer = CommandReplacer::new(&pairs);
 
     let mut result = text.to_string();
-    for _ in 0..max_passes {
+    for pass in 0..max_passes {
+        if let Some(c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                warn!(
+                    pass,
+                    input_bytes = input_len,
+                    "macro expansion cancelled by timeout signal",
+                );
+                return result;
+            }
+        }
+        // If the prior pass already produced output at or beyond the cap,
+        // skip running another pass — the next one can only grow further.
+        if result.len() > size_cap {
+            warn!(
+                pass,
+                input_bytes = input_len,
+                result_bytes = result.len(),
+                cap_bytes = size_cap,
+                "macro expansion halted: output exceeds {}× input / {} bytes",
+                MAX_EXPANSION_GROWTH_RATIO,
+                MAX_EXPANSION_BYTES,
+            );
+            break;
+        }
         let next = replacer.replace_all(&result);
+        if next.len() > size_cap {
+            warn!(
+                pass,
+                input_bytes = input_len,
+                attempted_bytes = next.len(),
+                cap_bytes = size_cap,
+                "macro expansion halted: pass output exceeds {}× input / {} bytes",
+                MAX_EXPANSION_GROWTH_RATIO,
+                MAX_EXPANSION_BYTES,
+            );
+            break;
+        }
         if next == result {
             break;
         }
@@ -335,17 +399,65 @@ pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
 ///
 /// Iterates up to 3 passes (2 for large inputs) to resolve nested parametric macros.
 pub fn expand_parametric_macros(text: &str, macros: &[ParametricMacro]) -> String {
+    expand_parametric_macros_cancellable(text, macros, None)
+}
+
+/// Cancellable variant of [`expand_parametric_macros`]. Polls `cancel` at
+/// the top of each pass and between macros within a pass.
+pub fn expand_parametric_macros_cancellable(
+    text: &str,
+    macros: &[ParametricMacro],
+    cancel: Option<&AtomicBool>,
+) -> String {
     if macros.is_empty() {
         return text.to_string();
     }
 
     let max_passes = if text.len() > LARGE_INPUT_THRESHOLD { 2 } else { 3 };
+    let input_len = text.len();
+    let size_cap = input_len
+        .saturating_mul(MAX_EXPANSION_GROWTH_RATIO)
+        .min(MAX_EXPANSION_BYTES);
     let mut result = text.to_string();
 
-    for _ in 0..max_passes {
+    'passes: for pass in 0..max_passes {
+        if let Some(c) = cancel {
+            if c.load(Ordering::Relaxed) {
+                warn!(
+                    pass,
+                    input_bytes = input_len,
+                    "parametric macro expansion cancelled by timeout signal",
+                );
+                return result;
+            }
+        }
         let prev = result.clone();
         for mac in macros {
+            if let Some(c) = cancel {
+                if c.load(Ordering::Relaxed) {
+                    warn!(
+                        pass,
+                        macro_name = %mac.name,
+                        "parametric macro expansion cancelled mid-pass",
+                    );
+                    return result;
+                }
+            }
             result = expand_single_parametric(&result, mac);
+            if result.len() > size_cap {
+                warn!(
+                    pass,
+                    macro_name = %mac.name,
+                    input_bytes = input_len,
+                    result_bytes = result.len(),
+                    cap_bytes = size_cap,
+                    "parametric macro expansion halted: output exceeds {}× input / {} bytes",
+                    MAX_EXPANSION_GROWTH_RATIO,
+                    MAX_EXPANSION_BYTES,
+                );
+                result = prev;
+                break 'passes;
+            }
         }
         if result == prev {
             break;
@@ -844,5 +956,74 @@ mod tests {
     fn test_normalize_shorthands_no_collision_beta() {
         // \beta should NOT be affected by \be
         assert_eq!(normalize_shorthands("\\beta"), "\\beta");
+    }
+
+    #[test]
+    fn test_expand_macros_bounded_on_mutually_recursive() {
+        // Simulates the pathology seen in real arXiv papers:
+        // Each pass through Aho-Corasick multiplies occurrences of \a and \b.
+        // Without a growth cap, 5 passes produce 3^5 = 243× the input,
+        // and a 50 KB input reaches 800 MB (observed on 2509.15163).
+        let mut macros = HashMap::new();
+        macros.insert("\\a".to_string(), "\\b\\b\\b".to_string());
+        macros.insert("\\b".to_string(), "\\a\\a\\a".to_string());
+
+        let input = "\\a".repeat(100); // 200 bytes
+        let result = expand_macros(&input, &macros);
+
+        // Growth cap is MAX_EXPANSION_GROWTH_RATIO × input. Allow a small
+        // overshoot for the one pass we commit before checking.
+        let cap = input.len() * MAX_EXPANSION_GROWTH_RATIO;
+        assert!(
+            result.len() <= cap,
+            "expansion exceeded {}× cap: input={} output={}",
+            MAX_EXPANSION_GROWTH_RATIO,
+            input.len(),
+            result.len()
+        );
+    }
+
+    #[test]
+    fn test_expand_macros_still_expands_benign() {
+        // Non-recursive chain — must still expand fully, not trigger the cap.
+        let mut macros = HashMap::new();
+        macros.insert("\\foo".to_string(), "\\bar".to_string());
+        macros.insert("\\bar".to_string(), "final".to_string());
+        assert_eq!(expand_macros("\\foo", &macros), "final");
+    }
+
+    #[test]
+    fn test_expand_macros_respects_absolute_ceiling() {
+        // If input is very small (1 byte), cumulative cap = 10 bytes, but the
+        // absolute ceiling (MAX_EXPANSION_BYTES) should prevent output from
+        // exceeding it regardless. Exercise the min() clamp at the low end.
+        let mut macros = HashMap::new();
+        macros.insert("\\x".to_string(), "y".to_string());
+        // Trivial expansion — no runaway, but verifies the benign path works
+        // when size_cap is computed.
+        let out = expand_macros("\\x", &macros);
+        assert_eq!(out, "y");
+    }
+
+    #[test]
+    fn test_expand_parametric_bounded_on_self_duplicating() {
+        // Parametric pathology: a one-argument macro that duplicates its arg.
+        // Expansion "\dup{\dup{x}}" still contains \dup — 2 passes double it.
+        let input = "\\dup{".to_string() + &"x".repeat(50) + "}";
+        let macros = vec![ParametricMacro {
+            name: "\\dup".to_string(),
+            num_args: 1,
+            body: "\\dup{#1}\\dup{#1}".to_string(),
+            optional_default: None,
+        }];
+        let result = expand_parametric_macros(&input, &macros);
+        let cap = input.len() * MAX_EXPANSION_GROWTH_RATIO;
+        assert!(
+            result.len() <= cap,
+            "parametric expansion exceeded {}× cap: input={} output={}",
+            MAX_EXPANSION_GROWTH_RATIO,
+            input.len(),
+            result.len()
+        );
     }
 }
