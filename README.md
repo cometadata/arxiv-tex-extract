@@ -258,7 +258,7 @@ A mid-tar kill loses at most the in-flight (not-yet-rotated) shard's
 papers, so the rerun re-extracts them and writes them into new shards that
 don't overwrite prior output.
 
-### Usage recipe
+### Usage
 
 ```bash
 # First invocation — run until done or until the OS kills the process.
