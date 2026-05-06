@@ -3,16 +3,13 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-/// AMSTeX \proclaim...\endproclaim → theorem formatting
 static PROCLAIM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\\proclaim\s*(?:\{([^{}]*)\})?\s*").unwrap()
 });
 
-/// AMSTeX \subhead...\endsubhead → heading formatting
 static SUBHEAD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\subhead\s*").unwrap());
 
-// "part" is handled by replace_sectioning_command (unnumbered), not the numbered path
 static PART_COMMAND: (&str, &str) = ("part", "\n# ");
 
 static PARAGRAPH_COMMANDS: &[&str] = &["paragraph", "subparagraph"];
@@ -41,7 +38,7 @@ static ACK_END_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\end\{acknowledge?ments?\}").unwrap());
 
 /// Convert LaTeX structural commands to markdown-style headers.
-/// Populates `section_label_map` with label → section number mappings.
+/// Populates `section_label_map` with label -> section number mappings.
 pub fn convert_structure(text: &str, section_label_map: &mut HashMap<String, String>) -> String {
     let mut result = text.to_string();
 
@@ -53,13 +50,11 @@ pub fn convert_structure(text: &str, section_label_map: &mut HashMap<String, Str
         result = replace_paragraph_command(&result, cmd);
     }
 
-    // REVTeX superscriptaddress: \author{Name} \affiliation{...} without [labels].
-    // Must run before both the Elsevier handler and the generic TITLE_COMMANDS.
+    // Must run before the Elsevier handler and TITLE_COMMANDS, which would
+    // otherwise consume \author and \affiliation first.
     result = convert_revtex_author_affiliation(&result);
 
-    // Elsevier-style \author[label]{name} / \address[label]{affiliation} —
-    // resolve label cross-references to superscript indices. Must run before
-    // the generic TITLE_COMMANDS handler consumes \author and \address.
+    // Must run before TITLE_COMMANDS consumes \author and \address.
     result = convert_labeled_author_address(&result);
 
     for &(cmd, prefix) in TITLE_COMMANDS {
@@ -93,15 +88,11 @@ pub fn convert_structure(text: &str, section_label_map: &mut HashMap<String, Str
     result = SUBHEAD_RE.replace_all(&result, "\n### ").to_string();
     result = result.replace("\\endsubhead", "\n");
 
-    // \institute{...} — Springer/A&A class: \and-separated affiliations,
-    // implicitly numbered starting from 1. Also resolves \inst{\ref{label}}
-    // on author names using the label→index map extracted from \institute.
     result = convert_institute_and_inst(&result);
 
     result
 }
 
-/// Section commands with their depth level and markdown prefix.
 const NUMBERED_SECTION_COMMANDS: &[(&str, &str, usize)] = &[
     ("chapter", "\n# ", 0),
     ("section", "\n## ", 1),
@@ -109,7 +100,6 @@ const NUMBERED_SECTION_COMMANDS: &[(&str, &str, usize)] = &[
     ("subsubsection", "\n#### ", 3),
 ];
 
-/// Maintains counters for hierarchical section numbering.
 struct SectionCounters {
     counters: [usize; 4],
 }
@@ -119,14 +109,13 @@ impl SectionCounters {
         Self { counters: [0; 4] }
     }
 
-    /// Increment counter at `depth`, reset all deeper levels,
-    /// return the composite section number string (e.g. "1.2.3").
+    /// Increment counter at `depth`, reset deeper levels, and return the
+    /// composite section number (e.g. "1.2.3").
     fn increment(&mut self, depth: usize) -> String {
         self.counters[depth] += 1;
         for d in (depth + 1)..4 {
             self.counters[d] = 0;
         }
-        // Find the top-level that is non-zero to determine the number format
         let top = (0..=depth).find(|&d| self.counters[d] > 0).unwrap_or(depth);
         (top..=depth)
             .map(|d| self.counters[d].to_string())
@@ -135,9 +124,6 @@ impl SectionCounters {
     }
 }
 
-/// Single-pass replacement of all numbered sectioning commands.
-/// Scans for the earliest match among chapter/section/subsection/subsubsection
-/// at each position, assigns hierarchical numbers, and collects \label mappings.
 fn replace_numbered_sections(text: &str, section_label_map: &mut HashMap<String, String>) -> String {
     let mut result = String::with_capacity(text.len());
     let mut counters = SectionCounters::new();
@@ -164,7 +150,7 @@ fn replace_numbered_sections(text: &str, section_label_map: &mut HashMap<String,
 
                 if best.is_none() || abs_pos < best.unwrap().0 {
                     let is_starred = after < bytes.len() && bytes[after] == b'*';
-                    // Encode "starred" as depth 99 to distinguish from numbered variants
+                    // Sentinel depth 99 distinguishes starred (unnumbered) from numbered variants
                     let effective_depth = if is_starred { 99 } else { depth };
                     best = Some((abs_pos, cmd_end, prefix, effective_depth));
                 }
@@ -223,8 +209,6 @@ fn replace_numbered_sections(text: &str, section_label_map: &mut HashMap<String,
     result
 }
 
-/// Replace a sectioning command like `\section*?[short]{Full Title}` with `prefix Full Title\n`.
-/// Uses `find_braced_group` for arbitrarily nested braces in the title.
 fn replace_sectioning_command(text: &str, cmd_name: &str, prefix: &str) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());
@@ -302,13 +286,10 @@ fn replace_paragraph_command(text: &str, cmd_name: &str) -> String {
     result
 }
 
-/// Detect REVTeX `superscriptaddress` pattern: multiple `\author{Name}` (no optional
-/// label) each optionally followed by `\email{...}`, then `\affiliation{...}`.
-/// Assigns superscript indices linking authors to their affiliations.
-///
-/// Only activates when there are multiple `\author` commands AND at least one
-/// `\affiliation` command, and the `\author` commands lack `[label]` optional args
-/// (which would indicate Elsevier style instead).
+/// Detect REVTeX `superscriptaddress` pattern and assign superscript indices
+/// linking authors to their affiliations. Only activates when there are
+/// multiple `\author` commands AND at least one `\affiliation`, and the
+/// `\author` commands lack `[label]` (which would indicate Elsevier style).
 fn convert_revtex_author_affiliation(text: &str) -> String {
     let auth_pat = "\\author";
     let affil_pat = "\\affiliation";
@@ -335,8 +316,8 @@ fn convert_revtex_author_affiliation(text: &str) -> String {
         let next_affil = text[search_start..].find(affil_pat).map(|p| search_start + p);
         let next_altaffil = text[search_start..].find(altaffil_pat).map(|p| search_start + p);
 
-        // Disambiguate: if \affiliation and \altaffiliation match at the same
-        // position, prefer \altaffiliation (it's the longer, more specific command).
+        // \affiliation is a prefix of \altaffiliation; prefer the longer match
+        // when both fire at the same position.
         let next_affil = next_affil.and_then(|f| {
             if let Some(a) = next_altaffil {
                 if f == a { None } else { Some(f) }
@@ -369,7 +350,7 @@ fn convert_revtex_author_affiliation(text: &str) -> String {
                     search_start = after;
                     continue;
                 }
-                // Optional [label] indicates Elsevier style -- bail out
+                // [label] indicates Elsevier style; defer to that handler
                 let ws_pos = skip_ws_bytes(bytes, after);
                 if ws_pos < bytes.len() && bytes[ws_pos] == b'[' {
                     return text.to_string();
@@ -439,7 +420,6 @@ fn convert_revtex_author_affiliation(text: &str) -> String {
         }
     }
 
-    // Need at least 2 authors and 1 affiliation for this pattern to apply
     let num_authors = entries.iter().filter(|e| matches!(e, Entry::Author { .. })).count();
     let num_affils = entries.iter().filter(|e| matches!(e, Entry::Affiliation { .. })).count();
     if num_authors < 2 || num_affils == 0 {
@@ -464,9 +444,8 @@ fn convert_revtex_author_affiliation(text: &str) -> String {
         }
     }
 
-    // Assign each author the index of the affiliation that follows them.
     // REVTeX rule: an \affiliation applies to all preceding \author entries
-    // since the last \affiliation. \altaffiliation applies only to the
+    // since the last \affiliation; \altaffiliation applies only to the
     // immediately preceding author.
     let mut author_affils: Vec<(usize, Vec<usize>)> = Vec::new();
     let mut pending_authors: Vec<usize> = Vec::new();
@@ -492,10 +471,8 @@ fn convert_revtex_author_affiliation(text: &str) -> String {
                 pending_authors.clear();
             }
             Entry::AltAffiliation { content, .. } => {
-                // \altaffiliation applies only to the immediately preceding author
                 let trimmed = content.trim().to_string();
                 if let Some(&idx) = affil_map.get(&trimmed) {
-                    // Find the last author entry before this one
                     let last_author_idx = entries[..i].iter().rposition(|e| matches!(e, Entry::Author { .. }));
                     if let Some(ai) = last_author_idx {
                         if let Some(existing) = author_affils.iter_mut().find(|(ei, _)| *ei == ai) {
@@ -511,7 +488,6 @@ fn convert_revtex_author_affiliation(text: &str) -> String {
         }
     }
 
-    // Now rebuild the text, replacing \author and \affiliation entries
     let mut result = String::with_capacity(text.len());
     let mut last_end = 0;
     let mut affils_emitted = false;
@@ -558,7 +534,7 @@ fn convert_revtex_author_affiliation(text: &str) -> String {
     result
 }
 
-/// Convert Elsevier-style `\author[label]{Name}` and `\address[label]{Affiliation}`
+/// Convert Elsevier-style `\author[label]{Name}` / `\address[label]{Affiliation}`
 /// into numbered cross-references. Only activates when `\address` commands have
 /// optional `[label]` arguments.
 fn convert_labeled_author_address(text: &str) -> String {
@@ -693,7 +669,6 @@ fn convert_labeled_author_address(text: &str) -> String {
     resolved
 }
 
-/// Skip whitespace bytes, return new position.
 fn skip_ws_bytes(bytes: &[u8], pos: usize) -> usize {
     let mut i = pos;
     while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n') {
@@ -702,8 +677,6 @@ fn skip_ws_bytes(bytes: &[u8], pos: usize) -> usize {
     i
 }
 
-/// Extract content of `[...]` starting at `pos` (which must be `[`).
-/// Returns `(content, position_after_closing_bracket)`.
 fn extract_bracket_content(text: &str, pos: usize) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
     if pos >= bytes.len() || bytes[pos] != b'[' {
@@ -726,16 +699,14 @@ fn extract_bracket_content(text: &str, pos: usize) -> Option<(String, usize)> {
     }
 }
 
-/// Regex to extract `\label{key}` from institute entries.
 static LABEL_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\label\{([^{}]*)\}").unwrap());
 
-/// Regex to extract `\ref{key}` inside `\inst{...}`.
 static REF_KEY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\ref\{([^{}]*)\}").unwrap());
 
 /// Convert `\institute{...}` to a numbered affiliation list and resolve
-/// `\inst{...}` on author names using the label→index mapping.
+/// `\inst{...}` on author names using the label->index mapping.
 fn convert_institute_and_inst(text: &str) -> String {
     let mut label_map: HashMap<String, usize> = HashMap::new();
     let mut result = String::with_capacity(text.len());
@@ -770,7 +741,7 @@ fn convert_institute_and_inst(text: &str) -> String {
                                 i += 1;
                             }
                             if i < cb.len() {
-                                i += 1; // skip ']'
+                                i += 1;
                             }
                         }
                     } else {
@@ -951,7 +922,6 @@ mod tests {
 
     #[test]
     fn test_subsection() {
-        // A subsection without a preceding section gets number 0.1
         let result = cs(r"\section{A}\subsection{Details}");
         assert!(result.contains("### 1.1. Details"), "subsection: {result}");
     }
@@ -1053,17 +1023,14 @@ mod tests {
             r"\institute{Dept A\label{inst:A} \and Dept B\label{inst:B}}"
         );
         let result = cs(input);
-        // \inst refs should resolve to superscript indices
         assert!(result.contains("Smith\u{00B9},\u{00B2}"), "expected Smith¹,²: {result}");
         assert!(result.contains("Jones\u{00B2}"), "expected Jones²: {result}");
-        // Affiliations numbered and \label stripped
         assert!(result.contains("\u{00B9} Dept A"), "missing ¹ Dept A: {result}");
         assert!(result.contains("\u{00B2} Dept B"), "missing ² Dept B: {result}");
     }
 
     #[test]
     fn test_inst_bare_numbers() {
-        // \inst{1,2} without \ref — should still convert to superscripts
         let input = r"\institute{Dept A \and Dept B}\author{Smith\inst{1,2}}";
         let result = cs(input);
         assert!(result.contains("Smith\u{00B9},\u{00B2}"), "expected Smith¹,²: {result}");
@@ -1098,7 +1065,6 @@ mod tests {
 
     #[test]
     fn test_institute_inst_prefix_format() {
-        // \inst{N} prefix format without \and — e.g. Springer llncs
         let input = r"\institute{\inst{1} Laboratoire A \\ \inst{2} Instituut B}";
         let result = cs(input);
         assert!(result.contains("\u{00B9} Laboratoire A"), "missing ¹ Laboratoire A: {result}");
@@ -1110,7 +1076,6 @@ mod tests {
         let input = r"\author{Alice}\affiliation{MIT}\author{Bob}\altaffiliation{Also at: CERN}\affiliation{Stanford}";
         let result = cs(input);
         assert!(result.contains("Also at: CERN"), "altaffiliation content missing: {result}");
-        // Bob should be linked to both Stanford and the altaffiliation
         assert!(result.contains("Bob"), "Bob missing: {result}");
     }
 }

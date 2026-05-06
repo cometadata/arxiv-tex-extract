@@ -7,15 +7,14 @@ use anyhow::{Context, Result};
 
 /// Checkpoint state parsed from the log file.
 ///
-/// Two entry formats coexist for backward compatibility:
+/// Two entry formats coexist:
 /// - Bare tar name (1 field): the whole tar completed.
 /// - `tar_name\tarxiv_id` (2 fields): that specific paper's row is in a
 ///   readable shard on disk.
 ///
-/// The per-paper form is written as each shard is closed (see
-/// `ParquetShardWriter::close_shard` and `JsonlShardWriter::close_shard`),
-/// preserving the invariant that every paper in `papers` is in a readable
-/// shard footer, not a lingering `.tmp`.
+/// Invariant: every paper in `papers` is in a readable shard footer,
+/// not a lingering `.tmp`. Per-paper entries are written only after a
+/// shard's `.tmp` → final rename.
 #[derive(Debug, Default, Clone)]
 pub struct Checkpoint {
     pub tars: HashSet<String>,
@@ -53,15 +52,12 @@ pub fn load(path: &Path) -> Result<Checkpoint> {
     Ok(cp)
 }
 
-/// Load only the set of completed tar names (legacy-compatible view).
-///
-/// Retained for callers that don't need per-paper information.
+/// Load only the set of completed tar names.
 pub fn load_checkpoint(path: &Path) -> Result<HashSet<String>> {
     Ok(load(path)?.tars)
 }
 
 /// Append a completed tar name to the checkpoint file and fsync.
-///
 /// Creates the file if it doesn't exist.
 pub fn record_checkpoint(path: &Path, tar_name: &str) -> Result<()> {
     let mut file = OpenOptions::new()
@@ -77,14 +73,11 @@ pub fn record_checkpoint(path: &Path, tar_name: &str) -> Result<()> {
 }
 
 /// Append a batch of completed `(tar_name, arxiv_id)` entries and fsync.
+/// Each line is written as `tar\tarxiv_id`. Must only be called after the
+/// shard's rows are on disk in a readable (footer-complete) state.
 ///
-/// Each line is written as `tar\tarxiv_id`. Called from the writer's
-/// `close_shard` path — i.e. only after the shard's rows are on disk in a
-/// readable (footer-complete) state. This single fsync per shard bounds
-/// kill-loss to the in-flight shard's rows.
-///
-/// Safe for concurrent callers: the OS append is atomic for writes
-/// under PIPE_BUF, which each `tar\tid\n` line comfortably is.
+/// Safe for concurrent callers: the OS append is atomic for writes under
+/// PIPE_BUF, which each `tar\tid\n` line comfortably is.
 pub fn record_papers(path: &Path, tar_name: &str, arxiv_ids: &[String]) -> Result<()> {
     if arxiv_ids.is_empty() {
         return Ok(());
@@ -204,7 +197,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint.log");
 
-        // Legacy tar-only entries alongside new per-paper entries.
         record_checkpoint(&path, "legacy_completed.tar").unwrap();
         record_papers(&path, "fresh_tar", &["2401.00001".into()]).unwrap();
         record_checkpoint(&path, "another_legacy.tar").unwrap();
@@ -227,7 +219,6 @@ mod tests {
         record_checkpoint(&path, "done.tar").unwrap();
         record_papers(&path, "inflight.tar", &["2401.00001".into()]).unwrap();
 
-        // Legacy loader returns only bare-tar entries.
         let tars = load_checkpoint(&path).unwrap();
         assert_eq!(tars.len(), 1);
         assert!(tars.contains("done.tar"));

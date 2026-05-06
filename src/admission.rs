@@ -1,19 +1,13 @@
 //! Counting-semaphore admission control for per-paper extractor threads.
 //!
-//! The pre-spawn `get_allocated_bytes() > max_memory` check at
-//! `src/main.rs` was racy: N rayon workers could read a stale pre-spawn
-//! RSS value simultaneously and all pass. This module replaces that with
-//! a counting semaphore so at most `max_inflight` extractor threads hold
-//! in-flight allocations at any time, bounding peak RSS regardless of
-//! rayon worker count.
+//! At most `max_inflight` extractor threads hold in-flight allocations at
+//! any time, bounding peak RSS regardless of rayon worker count.
 
 use std::sync::{Arc, Condvar, Mutex};
 
-/// Fixed-capacity counting semaphore.
-///
-/// Permit count is established at construction and does not change.
-/// `acquire_owned` blocks until a permit is available; the returned
-/// `OwnedAdmissionPermit` releases the permit on drop.
+/// Fixed-capacity counting semaphore. `acquire_owned` blocks until a
+/// permit is available; the returned `OwnedAdmissionPermit` releases the
+/// permit on drop.
 pub struct AdmissionControl {
     permits: Mutex<usize>,
     cv: Condvar,
@@ -27,8 +21,8 @@ impl AdmissionControl {
         }
     }
 
-    /// Blocking, self-owned acquire. Moves an Arc clone into the permit
-    /// so it can cross thread boundaries (`thread::spawn` requires 'static).
+    /// Blocking acquire. Moves an Arc clone into the permit so it can
+    /// cross thread boundaries (`thread::spawn` requires 'static).
     pub fn acquire_owned(self: &Arc<Self>) -> OwnedAdmissionPermit {
         let mut p = self.permits.lock().unwrap();
         while *p == 0 {

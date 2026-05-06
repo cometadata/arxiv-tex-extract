@@ -4,12 +4,10 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-/// Regex to strip `\left`, `\right`, and `\big` sizing decorators from delimiters.
 static LEFT_RIGHT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\\(?:left|right|[Bb]ig{1,2}[lr])\s*(\\[{}|]|[()\[\]|.])").unwrap()
 });
 
-/// Spacing commands to replace with a space (handled in cleanup).
 const SPACING_COMMANDS: &[&str] = &[
     "quad", "qquad", "hfill", "vfill", "hspace", "vspace",
     "bigskip", "medskip", "smallskip", "noindent", "indent",
@@ -19,7 +17,6 @@ const SPACING_COMMANDS: &[&str] = &[
     "nonumber", "notag", "allowbreak",
 ];
 
-/// Font switch commands to remove.
 const FONT_SWITCHES: &[&str] = &[
     "it", "bf", "rm", "tt", "sc", "sl", "sf", "em",
     "normalfont", "bfseries", "itshape", "mdseries",
@@ -36,7 +33,6 @@ static SPACING_DIM_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// TeX length registers that take `=` + dimension.
 static LENGTH_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\\(?:baselineskip|parskip|parindent|lineskip|lineskiplimit|topskip|abovedisplayskip|belowdisplayskip|abovedisplayshortskip|belowdisplayshortskip|columnsep|columnseprule|tabcolsep|arraycolsep|fboxsep|fboxrule|jot)\s*=?\s*-?\.?\d[\d.]*\s*(?:cm|mm|pt|em|ex|in|bp|dd|cc|sp|pc|mu|fil(?:l(?:l)?)?)?"
@@ -44,7 +40,6 @@ static LENGTH_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// No-op / structural commands that can be safely removed.
 const NOOP_COMMANDS: &[&str] = &[
     "relax", "par", "empty", "protect", "raggedright", "raggedleft",
     "centering", "sloppy", "fussy", "samepage", "nopagebreak",
@@ -53,8 +48,7 @@ const NOOP_COMMANDS: &[&str] = &[
     "makeindex", "printindex", "printglossary",
 ];
 
-/// Commands whose entire invocation (command + N braced args) should be removed.
-/// (command_name, number_of_braced_args_to_consume)
+/// (command_name, number_of_braced_args_to_consume) — entire invocation is removed.
 const STRIP_WITH_ARGS: &[(&str, usize)] = &[
     ("pagestyle", 1),
     ("thispagestyle", 1),
@@ -81,7 +75,6 @@ const STRIP_WITH_ARGS: &[(&str, usize)] = &[
     ("tikzset", 1),
     ("pgfplotsset", 1),
     ("addvspace", 1),
-    // Configuration commands whose args should not leak as text
     ("hypersetup", 1),
     ("definecolor", 3),
     ("colorlet", 2),
@@ -90,7 +83,6 @@ const STRIP_WITH_ARGS: &[(&str, usize)] = &[
     ("markright", 1),
     ("DeclareRobustCommand", 2),
     ("pagenumbering", 1),
-    // Index/glossary entries (should not leak into text)
     ("index", 1),
     ("glossary", 1),
 ];
@@ -122,7 +114,7 @@ pub fn strip_pre_diacritic_commands(text: &str) -> String {
 }
 
 /// Strip `\left`, `\right`, and `\big*` sizing decorators, leaving the delimiter.
-/// `\left(` → `(`, `\left\{` → `{`, `\left.` → nothing (invisible delimiter).
+/// `\left.` becomes empty (invisible delimiter).
 fn strip_left_right_delimiters(text: &str) -> String {
     LEFT_RIGHT_RE
         .replace_all(text, |caps: &regex::Captures| {
@@ -137,7 +129,6 @@ fn strip_left_right_delimiters(text: &str) -> String {
         .to_string()
 }
 
-/// Remove `\cmd{arg1}{arg2}...` consuming exactly `n_args` braced groups.
 fn strip_command_with_args(text: &str, cmd_name: &str, n_args: usize) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());
@@ -178,9 +169,9 @@ fn strip_command_with_args(text: &str, cmd_name: &str, n_args: usize) -> String 
     result
 }
 
-/// Identify byte ranges of math regions: `$...$`, `$$...$$`, `\(...\)`, `\[...\]`,
-/// and named math environments like `\begin{equation}...\end{equation}`.
-/// Returns a sorted, non-overlapping `Vec<(start, end)>` (end is exclusive).
+/// Byte ranges of math regions: `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, and
+/// named math environments. Returns sorted, merged, non-overlapping ranges
+/// (end exclusive).
 pub(crate) fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut regions = Vec::new();
@@ -254,8 +245,7 @@ pub(crate) fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
         i += 1;
     }
 
-    // Also detect named math environments (safety net for unconverted envs).
-    // Uses the canonical MATH_ENVS list from environments.rs.
+    // Safety net for math environments that survived `convert_environments`.
     for env in MATH_ENVS {
         let begin_pat = format!("\\begin{{{env}}}");
         let end_pat = format!("\\end{{{env}}}");
@@ -272,7 +262,6 @@ pub(crate) fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
         }
     }
 
-    // Sort and merge overlapping regions
     regions.sort_by_key(|&(s, _)| s);
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(regions.len());
     for (s, e) in regions {
@@ -287,7 +276,6 @@ pub(crate) fn find_math_regions(text: &str) -> Vec<(usize, usize)> {
     merged
 }
 
-/// Check if byte position `pos` falls inside any math region (binary search).
 pub(crate) fn in_math(pos: usize, regions: &[(usize, usize)]) -> bool {
     regions
         .binary_search_by(|&(start, end)| {
@@ -302,7 +290,6 @@ pub(crate) fn in_math(pos: usize, regions: &[(usize, usize)]) -> bool {
         .is_ok()
 }
 
-/// Math commands to preserve (not strip as orphan commands).
 static MATH_KEEP: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "frac", "sum", "int", "prod", "sqrt", "lim", "log", "ln",
@@ -338,7 +325,6 @@ static MULTI_SPACE_RE: LazyLock<Regex> =
 static MULTI_NEWLINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
 
-/// Strip stray backslashes: a `\` NOT followed by an ASCII letter, another `\`, or `$`.
 fn strip_stray_backslashes(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut result = String::with_capacity(text.len());
@@ -369,9 +355,9 @@ fn strip_stray_backslashes(text: &str) -> String {
     result
 }
 
-/// Reflow paragraphs: join single-newline-separated lines within paragraphs.
-/// Preserves: paragraph breaks (\n\n), headings (#), list items (- ), display math ($$),
-/// bold labels (**), and lines that are very short (likely intentional breaks).
+/// Join single-newline-separated lines within paragraphs. Preserves
+/// paragraph breaks (\n\n), headings (#), list items (- ), display math ($$),
+/// and bold labels (**).
 fn reflow_paragraphs(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let lines: Vec<&str> = text.split('\n').collect();
@@ -410,7 +396,6 @@ fn reflow_paragraphs(text: &str) -> String {
     result
 }
 
-/// Final cleanup pass.
 pub fn cleanup(text: &str) -> String {
     let mut result = text.to_string();
 
@@ -422,7 +407,7 @@ pub fn cleanup(text: &str) -> String {
     result = PHANTOM_RE.replace_all(&result, "").to_string();
     result = RULE_RE.replace_all(&result, "").to_string();
 
-    // Second pass catches font switches that leak through nested unwrapping
+    // Second pass: catch font switches that leak through nested unwrapping.
     for cmd in FONT_SWITCHES {
         result = remove_font_switch(&result, cmd);
     }
@@ -453,7 +438,6 @@ pub fn cleanup(text: &str) -> String {
     result
 }
 
-/// Remove a spacing command like `\quad`, `\hspace{1cm}`, etc.
 fn remove_spacing_command(text: &str, cmd_name: &str) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());
@@ -491,7 +475,6 @@ fn remove_spacing_command(text: &str, cmd_name: &str) -> String {
     result
 }
 
-/// Remove a standalone font switch command like \it, \bf.
 fn remove_font_switch(text: &str, cmd_name: &str) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());
@@ -517,9 +500,8 @@ fn remove_font_switch(text: &str, cmd_name: &str) -> String {
     result
 }
 
-/// Unwrap generic \command{content} → content.
-/// Scans left-to-right, finds \command patterns, extracts braced args.
-/// Skips commands whose start position falls inside a math region.
+/// Unwrap generic \command{content} -> content. Skips commands whose start
+/// position falls inside a math region.
 fn unwrap_generic_commands(text: &str) -> String {
     let math_regions = find_math_regions(text);
     let mut result = String::with_capacity(text.len());
@@ -556,9 +538,8 @@ fn unwrap_generic_commands(text: &str) -> String {
     result
 }
 
-/// Strip grouping braces `{content}` → `content`.
-/// Only strips braces that are not preceded by a backslash.
-/// Skips braces inside math regions.
+/// Strip grouping braces `{content}` -> `content`. Skips backslash-escaped
+/// braces and braces inside math regions.
 fn strip_grouping_braces(text: &str) -> String {
     let math_regions = find_math_regions(text);
     let mut result = String::with_capacity(text.len());
@@ -579,7 +560,6 @@ fn strip_grouping_braces(text: &str) -> String {
     result
 }
 
-/// Strip orphan \commands that aren't math operators.
 fn strip_orphan_commands(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut result = String::with_capacity(text.len());
@@ -740,8 +720,8 @@ mod tests {
 
     #[test]
     fn test_inline_math_paren_content_preserved() {
-        // \( and \) lose backslashes via strip_stray_backslashes,
-        // but the math content inside must be preserved
+        // \( and \) lose backslashes via strip_stray_backslashes; the math
+        // content inside must be preserved.
         let result = cleanup(r"\(\frac{x}{y}\)");
         assert!(result.contains(r"\frac{x}{y}"));
     }
@@ -769,7 +749,6 @@ mod tests {
 
     #[test]
     fn test_find_math_regions_merge_overlapping() {
-        // $$ inside a named env should merge into one region
         let input = r"\begin{equation}$$x$$\end{equation}";
         let regions = find_math_regions(input);
         assert_eq!(regions.len(), 1, "overlapping regions should merge");
@@ -876,8 +855,6 @@ mod tests {
         assert!(!result.contains("toc"));
     }
 
-    // --- \left/\right stripping ---
-
     #[test]
     fn test_left_right_parens() {
         let result = strip_left_right_delimiters(r"\left( x \right)");
@@ -925,8 +902,6 @@ mod tests {
         let result = strip_left_right_delimiters(r"\Biggl( x \Biggr)");
         assert_eq!(result, "( x )");
     }
-
-    // --- Stage 5c: additional strip commands ---
 
     #[test]
     fn test_geometry_stripped() {

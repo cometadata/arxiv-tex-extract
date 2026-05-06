@@ -38,7 +38,6 @@ pub fn find_braced_group(s: &str, open_pos: usize) -> Option<(usize, usize)> {
 /// Use this for formatting commands where dropping content entirely is worse
 /// than a slightly imprecise boundary (e.g., `\textbf{unclosed text`).
 pub fn find_braced_group_tolerant(s: &str, open_pos: usize) -> Option<(usize, usize)> {
-    // Try strict matching first
     if let result @ Some(_) = find_braced_group(s, open_pos) {
         return result;
     }
@@ -47,7 +46,6 @@ pub fn find_braced_group_tolerant(s: &str, open_pos: usize) -> Option<(usize, us
         return None;
     }
     let content_start = open_pos + 1;
-    // Fallback: scan to the next paragraph break, next \ command, or end of line
     let mut i = content_start;
     while i < bytes.len() {
         match bytes[i] {
@@ -61,7 +59,6 @@ pub fn find_braced_group_tolerant(s: &str, open_pos: usize) -> Option<(usize, us
         }
         i += 1;
     }
-    // Hit end of string
     if i > content_start {
         Some((content_start, i))
     } else {
@@ -100,8 +97,8 @@ pub fn extract_command_arg_tolerant(s: &str, cmd_end: usize) -> Option<(usize, u
         return None;
     }
     let (content_start, content_end) = find_braced_group_tolerant(s, i)?;
-    // If strict match succeeded, content_end is at '}' — skip past it.
-    // If fallback was used, content_end is at the boundary — don't skip.
+    // Strict match: content_end is at '}', skip past it.
+    // Tolerant fallback: content_end is at the boundary, do not skip.
     let after_close = if content_end < bytes.len() && bytes[content_end] == b'}' {
         content_end + 1
     } else {
@@ -110,8 +107,8 @@ pub fn extract_command_arg_tolerant(s: &str, cmd_end: usize) -> Option<(usize, u
     Some((content_start, content_end, after_close))
 }
 
-/// Skip an optional argument `[...]` if present at position `pos`.
-/// Returns the position after the closing `]`, or `pos` if no `[` found.
+/// Skip an optional `[...]` argument if present. Returns the position after
+/// `]`, or `pos` if no `[` found.
 pub fn skip_optional_arg(s: &str, pos: usize) -> usize {
     let bytes = s.as_bytes();
     let mut i = pos;
@@ -176,10 +173,9 @@ pub fn extract_optional_arg(s: &str, pos: usize) -> Option<(usize, usize, usize)
     None
 }
 
-/// Find a LaTeX command like `\commandname` starting at position `pos` (which should be `\`).
-/// Returns the end position of the command name (exclusive), i.e., the index of the first
-/// character that is NOT part of the command name.
-/// Also handles starred variants like `\section*`.
+/// Return the end index (exclusive) of the LaTeX command starting at
+/// `backslash_pos`. Handles starred variants like `\section*` and single
+/// non-letter commands like `\#`.
 pub fn find_command_end(s: &str, backslash_pos: usize) -> usize {
     let bytes = s.as_bytes();
     if backslash_pos >= bytes.len() || bytes[backslash_pos] != b'\\' {
@@ -194,7 +190,6 @@ pub fn find_command_end(s: &str, backslash_pos: usize) -> usize {
             i += 1;
         }
     } else if i < bytes.len() {
-        // Single non-letter command like \# \$ \& etc.
         i += 1;
     }
     i
@@ -239,7 +234,7 @@ mod tests {
     fn test_extract_command_arg() {
         let s = r"\section{Introduction}";
         let cmd_end = find_command_end(s, 0);
-        assert_eq!(cmd_end, 8); // after "section"
+        assert_eq!(cmd_end, 8);
         let (cs, ce, after) = extract_command_arg(s, cmd_end).unwrap();
         assert_eq!(&s[cs..ce], "Introduction");
         assert_eq!(after, s.len());
@@ -265,14 +260,14 @@ mod tests {
     fn test_skip_optional_arg() {
         let s = r"[short title]{Full Title}";
         let after_opt = skip_optional_arg(s, 0);
-        assert_eq!(after_opt, 13); // one past "]"
+        assert_eq!(after_opt, 13);
     }
 
     #[test]
     fn test_skip_optional_arg_none() {
         let s = r"{Full Title}";
         let after_opt = skip_optional_arg(s, 0);
-        assert_eq!(after_opt, 0); // unchanged
+        assert_eq!(after_opt, 0);
     }
 
     #[test]
@@ -335,7 +330,7 @@ mod tests {
         let s = r"\cmd{unclosed text";
         let (cs, ce, after) = extract_command_arg_tolerant(s, 4).unwrap();
         assert_eq!(&s[cs..ce], "unclosed text");
-        assert_eq!(after, s.len()); // at end of string, no } to skip
+        assert_eq!(after, s.len());
     }
 
     #[test]

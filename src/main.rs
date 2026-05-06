@@ -28,7 +28,6 @@ use latex_extract::output::{JsonlShardWriter, ParquetShardWriter};
 use latex_extract::pipeline::extract_text_timed_cancellable;
 use latex_extract::result::ExtractionResult;
 
-/// Default maximum combined .tex content size (20MB).
 const DEFAULT_MAX_TEX_BYTES: usize = 20_000_000;
 
 /// Test-only hook: simulate a SIGKILL (jetsam / OOM) by calling
@@ -39,8 +38,6 @@ const DEFAULT_MAX_TEX_BYTES: usize = 20_000_000;
 mod test_hooks {
     use std::sync::atomic::{AtomicIsize, Ordering};
 
-    /// `-1` means unarmed. Any non-negative value counts down per paper;
-    /// when `fetch_sub` returns `1` the process exits with code 137.
     static COUNTDOWN: AtomicIsize = AtomicIsize::new(-1);
 
     pub fn arm_from_env() {
@@ -57,8 +54,6 @@ mod test_hooks {
         }
     }
 
-    /// Call after each successful paper write (in both tars-mode and
-    /// files-mode). When the countdown reaches zero, exit immediately.
     pub fn tick() {
         let prev = COUNTDOWN.fetch_sub(1, Ordering::Relaxed);
         if prev == 1 {
@@ -114,8 +109,7 @@ struct Args {
 
     /// Maximum concurrently-extracting papers. Bounds peak RSS independent
     /// of rayon worker count (rayon workers block at this semaphore when
-    /// the cap is reached). Default: `max_memory_mb / 150` (since per-paper
-    /// peak is ~125 MB after the macro-expansion fix) or
+    /// the cap is reached). Default: `max_memory_mb / 150` or
     /// `available_parallelism()` when `--max-memory-mb` is unset.
     #[arg(long)]
     max_inflight: Option<usize>,
@@ -143,6 +137,8 @@ struct Args {
     #[arg(long)]
     papers_per_shard: Option<usize>,
 
+
+
     /// Resume from checkpoint (skip already-processed tars)
     #[arg(long)]
     resume: bool,
@@ -168,7 +164,6 @@ impl OutputFormat {
     }
 }
 
-/// Log jemalloc memory stats.
 #[cfg(not(target_env = "msvc"))]
 fn log_memory_stats() {
     use tikv_jemalloc_ctl::{epoch, stats};
@@ -186,8 +181,7 @@ fn log_memory_stats() {
 }
 
 /// Current jemalloc resident bytes — closer to OS RSS than `allocated`
-/// because it includes pages held by arenas but not yet purged. Used for
-/// the backstop pressure-skip in `extract_with_timeout`.
+/// because it includes pages held by arenas but not yet purged.
 #[cfg(not(target_env = "msvc"))]
 fn get_resident_bytes() -> Option<usize> {
     use tikv_jemalloc_ctl::{epoch, stats};
@@ -221,8 +215,7 @@ fn main() -> Result<()> {
     let max_tex_bytes = args.max_tex_bytes;
     let max_memory_bytes: Option<usize> = args.max_memory_mb.map(|mb| mb * 1_048_576);
 
-    // Admission-control cap. Per-paper peak RSS post-macro-fix is ~125 MB,
-    // so 150 MB/paper is a safe amortised estimate.
+    // Admission-control cap: 150 MB/paper as a safe amortised estimate.
     let max_inflight = args.max_inflight.unwrap_or_else(|| {
         if let Some(mb) = args.max_memory_mb {
             (mb / 150).max(1)
@@ -239,14 +232,11 @@ fn main() -> Result<()> {
 
     let format = OutputFormat::parse(&args.output_format)?;
 
-    // Paper-count rotation trigger. When --papers-per-shard is unset, use
-    // usize::MAX so the existing max_shard_rows / max_shard_bytes triggers
-    // are the sole determinants of rotation (preserves prior behaviour).
+    // When --papers-per-shard is unset, use usize::MAX so only
+    // max_shard_rows / max_shard_bytes trigger rotation.
     let papers_per_shard = args.papers_per_shard.unwrap_or(usize::MAX);
 
-    // Per-paper checkpointing is gated on the same opt-in flag. When set,
-    // writers emit (tar, arxiv_id) checkpoint entries at each shard close,
-    // and --resume skips papers already durable on disk.
+    // Per-paper checkpointing is gated on the same opt-in flag.
     let enable_per_paper_checkpoint = args.papers_per_shard.is_some();
 
     if let Some(input_file) = &args.input_file {
@@ -274,7 +264,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Process a single archive file and print to stdout.
 fn process_single_file(input_file: &Path, timeout: Duration, max_tex_bytes: usize, max_memory_bytes: Option<usize>, text_files: bool, admission: Arc<AdmissionControl>) -> Result<()> {
     let paper = archive::load_paper_archive(input_file)
         .with_context(|| format!("loading {}", input_file.display()))?;
@@ -293,7 +282,6 @@ fn process_single_file(input_file: &Path, timeout: Duration, max_tex_bytes: usiz
     Ok(())
 }
 
-/// Process all outer tar files in batch mode.
 fn process_batch(
     input_dir: &Path,
     output_dir: &Path,
@@ -356,7 +344,6 @@ fn process_batch(
     Ok(())
 }
 
-/// Process outer tar files in parallel.
 fn process_outer_tars(
     tar_files: &[PathBuf],
     output_dir: &Path,
@@ -439,7 +426,7 @@ fn process_outer_tars(
         }
 
         // Return freed pages to the OS between tars so RSS plateaus
-        // instead of growing monotonically across the corpus.
+        // instead of growing monotonically.
         latex_extract::memory::purge_jemalloc_arenas();
 
         progress.inc(1);
@@ -654,18 +641,15 @@ fn process_individual_archives(
     Ok(())
 }
 
-/// Sanitize an arxiv ID for use as a filename (replace `/` with `_`).
 fn sanitize_id(id: &str) -> String {
     id.replace('/', "_")
 }
 
 /// Delete any `.tmp` shard files in `output_dir` that belong to `stem`.
 ///
-/// Called before a tar (or files-mode batch) starts so that debris from a
-/// prior-run kill doesn't confuse downstream readers. By the checkpoint
-/// invariant (entries only appear after `.tmp` → final rename), nothing
-/// in a `.tmp` is referenced by the checkpoint, so these are always
-/// discardable.
+/// By the checkpoint invariant (entries only appear after `.tmp` → final
+/// rename), nothing in a `.tmp` is referenced by the checkpoint, so these
+/// are always discardable.
 fn cleanup_stale_tmp_shards(output_dir: &Path, stem: &str) {
     let Ok(entries) = fs::read_dir(output_dir) else {
         return;
@@ -673,9 +657,6 @@ fn cleanup_stale_tmp_shards(output_dir: &Path, stem: &str) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        // Temp files look like `.{stem}.parquet.tmp`, `.{stem}_001.parquet.tmp`,
-        // or the JSONL equivalents. Match on the `.{stem}` prefix and `.tmp`
-        // suffix to avoid touching unrelated hidden files.
         if name_str.starts_with(&format!(".{}", stem)) && name_str.ends_with(".tmp") {
             let _ = fs::remove_file(entry.path());
         }
@@ -717,7 +698,6 @@ fn output_stem(path: &Path) -> String {
     stem.strip_suffix(".tar").unwrap_or(&stem).to_string()
 }
 
-/// Process individual archives, writing one .txt file per paper.
 fn process_individual_archives_text(
     files: &[PathBuf],
     output_dir: &Path,
@@ -773,7 +753,6 @@ fn process_individual_archives_text(
     Ok(())
 }
 
-/// Process outer tar files, writing one .txt file per paper.
 fn process_outer_tars_text(
     tar_files: &[PathBuf],
     output_dir: &Path,
@@ -824,8 +803,6 @@ fn process_outer_tars_text(
     Ok(())
 }
 
-/// Process a single outer tar file, writing .txt files per paper.
-/// Extract text from a paper archive, with trace-level logging before and after.
 fn extract_paper_with_trace(
     paper: &PaperArchive,
     source_tar: &str,
@@ -901,7 +878,6 @@ fn process_outer_tar_text(
     Ok(counts)
 }
 
-/// Process a single outer tar file.
 fn process_outer_tar(
     tar_path: &Path,
     output_dir: &Path,
@@ -928,10 +904,6 @@ fn process_outer_tar(
         .to_string_lossy()
         .to_string();
 
-    // Clean up any `.tmp` shard files left by a prior-run kill. By the
-    // checkpoint invariant (entries only appear after `.tmp` → final
-    // rename) these contain only rows not yet in the checkpoint, so
-    // discarding them is safe.
     cleanup_stale_tmp_shards(output_dir, &stem);
 
     let checkpoint_path = if enable_per_paper_checkpoint {
@@ -946,10 +918,8 @@ fn process_outer_tar(
 
     let mut counts = StatusCounts::default();
 
-    // Purge jemalloc arenas every PURGE_INTERVAL papers inside a tar.
-    // A single large tar can have thousands of papers; waiting until tar
-    // boundary for the coarse purge lets per-arena caches accumulate
-    // multi-GB across a long tar.
+    // Purge jemalloc arenas every PURGE_INTERVAL papers inside a tar so
+    // per-arena caches don't accumulate multi-GB across a long tar.
     const PURGE_INTERVAL: usize = 50;
     let mut papers_since_purge = 0usize;
 
@@ -1062,10 +1032,8 @@ fn process_outer_tar(
 }
 
 /// Build an archive-error ExtractionResult for an outer-tar entry whose
-/// path was successfully derived but which failed to load (e.g. oversized
-/// header, mid-read I/O error). Returns `None` for tar-level failures
-/// where no entry path was available — those aren't persisted to the
-/// output because there is nothing identifying to record.
+/// path was successfully derived but which failed to load. Returns `None`
+/// for tar-level failures where no entry path was available.
 fn build_archive_error_result(
     arxiv_id: String,
     entry_name: String,
@@ -1086,11 +1054,8 @@ fn build_archive_error_result(
     Some(result)
 }
 
-/// Classify an ExtractionResult into an Outcome.
-///
-/// Used when the caller receives a result from `extract_with_timeout` and
-/// doesn't know the internal reason for an "error" status. Archive errors
-/// are classified directly by callers — they never go through this function.
+/// Classify an ExtractionResult into an Outcome. Archive errors are
+/// classified directly by callers and never go through this function.
 fn classify_result(result: &ExtractionResult) -> Outcome {
     match result.status.as_str() {
         "ok" => Outcome::Ok,
@@ -1106,11 +1071,10 @@ fn classify_result(result: &ExtractionResult) -> Outcome {
 
 /// Process a single paper with panic isolation and a per-document timeout.
 ///
-/// Spawns a dedicated thread for extraction so that stuck documents (infinite
-/// macro loops, pathological regex) don't block the rayon worker pool. On
-/// timeout the parent sets a shared `AtomicBool` cancel flag; the spawned
-/// thread polls it between pipeline stages (src/pipeline.rs, src/macros.rs)
-/// and exits cooperatively instead of being silently leaked.
+/// Spawns a dedicated thread for extraction so stuck documents don't block
+/// the rayon worker pool. On timeout the parent sets a shared `AtomicBool`
+/// cancel flag which the spawned thread polls between pipeline stages,
+/// exiting cooperatively instead of being silently leaked.
 fn extract_with_timeout(
     paper: &PaperArchive,
     source_tar: Option<&str>,
@@ -1150,7 +1114,6 @@ fn extract_with_timeout(
     }
 
     // Clone data for the spawned thread (thread::spawn requires 'static).
-    // tex_files is an Arc<Vec<TexFile>>, so this is a refcount bump.
     let tex_files = Arc::clone(&paper.tex_files);
     let arxiv_id = paper.arxiv_id.clone();
     let file_type = paper.file_type;
@@ -1162,17 +1125,13 @@ fn extract_with_timeout(
 
     let (tx, rx) = mpsc::channel();
 
-    // Acquire an admission permit before doing any allocating work. The
-    // permit is moved into the closure so it lives exactly as long as the
-    // extractor thread, including during cooperative cancellation.
+    // The permit is moved into the closure so it lives exactly as long
+    // as the extractor thread, including during cooperative cancellation.
     let permit = admission.acquire_owned();
 
-    // Post-admission RSS backstop. Admission control bounds concurrency,
-    // but cumulative jemalloc retention plus in-flight writer buffers
-    // can still push process RSS past `max_memory_bytes`. Checking *after*
-    // acquiring the permit means the read is serialised — no racing
-    // workers — so we can purge first and re-check before skipping. Most
-    // of the "pressure" comes from retained arena pages, not live
+    // Post-admission RSS backstop. Checking *after* acquiring the permit
+    // serialises the read so we can purge first and re-check before
+    // skipping. Most "pressure" comes from retained arena pages, not live
     // allocations; a purge usually brings RSS back under the limit.
     if let Some(max_memory) = max_memory_bytes {
         if let Some(resident) = get_resident_bytes() {
@@ -1226,7 +1185,6 @@ fn extract_with_timeout(
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Signal the extractor thread to wind down on its next checkpoint.
             cancel.store(true, Ordering::Relaxed);
             error!(
                 category = "timeout",
@@ -1276,10 +1234,8 @@ fn extract_with_timeout(
     }
 }
 
-/// Process a single paper with panic isolation.
-///
-/// `cancel` is passed through to the extraction pipeline so that a parent
-/// timeout on `extract_with_timeout` can steer this work to exit early.
+/// Process a single paper with panic isolation. `cancel` is forwarded to
+/// the extraction pipeline so a parent timeout can steer it to exit early.
 fn process_paper(
     paper: &PaperArchive,
     source_tar: Option<&str>,
@@ -1302,7 +1258,6 @@ fn process_paper(
         };
     }
 
-    // Arc clone — refcount bump, not a deep copy of the Vec<TexFile>.
     let tex_files = Arc::clone(&paper.tex_files);
     let num_files = tex_files.len();
 
@@ -1414,11 +1369,9 @@ mod tests {
             file_type: FileType::Tex,
             entry_name: "test.gz".into(),
         };
-        // 100 bytes exceeds a 50-byte custom limit
         let result = extract_with_timeout(&paper, None, Duration::from_secs(5), 50, None, &test_admission());
         assert_eq!(result.status, "skipped");
 
-        // Same content passes with a larger limit
         let paper2 = PaperArchive {
             arxiv_id: "test.custom_limit_ok".into(),
             tex_files: Arc::new(vec![TexFile {
@@ -1434,11 +1387,6 @@ mod tests {
 
     #[test]
     fn test_timeout_fires() {
-        // Create a paper with content that will process quickly, but
-        // simulate a timeout by using a very short timeout duration
-        // with content that takes longer than that.
-        // We use a 0-second timeout to guarantee the timeout fires
-        // before the spawned thread completes.
         let paper = PaperArchive {
             arxiv_id: "test.timeout".into(),
             tex_files: Arc::new(vec![TexFile {
@@ -1448,10 +1396,7 @@ mod tests {
             file_type: FileType::Tex,
             entry_name: "test.gz".into(),
         };
-        // Duration::ZERO means recv_timeout returns immediately
         let result = extract_with_timeout(&paper, None, Duration::ZERO, DEFAULT_MAX_TEX_BYTES, None, &test_admission());
-        // With zero timeout, we get either timeout or the result (race),
-        // but the mechanism is exercised either way.
         assert!(result.status == "timeout" || result.status == "ok");
     }
 

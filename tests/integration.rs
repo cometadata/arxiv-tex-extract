@@ -8,12 +8,10 @@ use anyhow::Result;
 use arrow::array::{Array, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-/// Helper: create a minimal tar containing a single .gz paper.
 fn create_test_tar(dir: &Path, name: &str, arxiv_id: &str, tex_content: &str) -> std::path::PathBuf {
     create_test_tar_with_papers(dir, name, &[(arxiv_id, tex_content)])
 }
 
-/// Helper: create a tar containing multiple .gz papers.
 fn create_test_tar_with_papers(
     dir: &Path,
     name: &str,
@@ -159,9 +157,7 @@ fn test_checkpoint_resume_skips_completed() {
     create_test_tar(input_dir.path(), "batch_a.tar", "0001.00001", tex);
     create_test_tar(input_dir.path(), "batch_b.tar", "0002.00001", tex);
 
-    // Pre-populate checkpoint with batch_a already done
     fs::write(output_dir.path().join("checkpoint.log"), "batch_a.tar\n").unwrap();
-    // Also create the parquet file for batch_a (so the output exists)
     fs::write(output_dir.path().join("batch_a.parquet"), "dummy").unwrap();
 
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_latex-extract"))
@@ -268,7 +264,6 @@ fn test_files_mode_text() {
 
     assert!(status.success(), "binary exited with: {}", status);
 
-    // Verify output files named by input stems (not arxiv IDs)
     let a_path = output_dir.path().join("paper_a.txt");
     let b_path = output_dir.path().join("paper_b.txt");
     assert!(a_path.exists(), "paper_a.txt should exist");
@@ -300,7 +295,6 @@ fn test_files_mode_parquet() {
 
     assert!(status.success(), "binary exited with: {}", status);
 
-    // Find the parquet file (shard prefix is "individual")
     let parquet_files: Vec<_> = fs::read_dir(output_dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
@@ -482,7 +476,6 @@ fn test_kill_resume_round_trip_tars_mode() {
     assert!(status2.success(), "run 2 should succeed: {}", status2);
 
     let final_ids = collect_all_arxiv_ids(output_dir.path());
-    // Every paper should appear exactly once, no duplicates.
     let mut expected: Vec<String> = papers.iter().map(|(id, _)| id.clone()).collect();
     expected.sort();
     assert_eq!(
@@ -496,7 +489,6 @@ fn test_kill_resume_round_trip_tars_mode() {
         "no paper should be duplicated across shards"
     );
 
-    // No `.tmp` debris left behind.
     for entry in fs::read_dir(output_dir.path()).unwrap() {
         let name = entry.unwrap().file_name().to_string_lossy().to_string();
         assert!(!name.ends_with(".tmp"), "stale tmp left: {name}");
@@ -514,7 +506,6 @@ fn test_kill_resume_round_trip_files_mode() {
         create_test_gz(input_dir.path(), &format!("{}.gz", id), tex);
     }
 
-    // Run 1: kill after 3 writes.
     let status1 = std::process::Command::new(env!("CARGO_BIN_EXE_latex-extract"))
         .args([
             "-d", input_dir.path().to_str().unwrap(),
@@ -545,7 +536,6 @@ fn test_kill_resume_round_trip_files_mode() {
         checkpoint_content
     );
 
-    // Run 2: resume.
     let status2 = std::process::Command::new(env!("CARGO_BIN_EXE_latex-extract"))
         .args([
             "-d", input_dir.path().to_str().unwrap(),

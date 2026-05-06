@@ -59,7 +59,6 @@ pub fn remove_comments(text: &str) -> String {
     result
 }
 
-/// Count how many consecutive backslashes appear immediately before position `pos`.
 fn count_preceding_backslashes(bytes: &[u8], pos: usize) -> usize {
     let mut count = 0;
     let mut j = pos;
@@ -101,13 +100,11 @@ mod tests {
 
     #[test]
     fn test_line_joining() {
-        // word%\njoined → wordjoined
         assert_eq!(remove_comments("word%\njoined"), "wordjoined");
     }
 
     #[test]
     fn test_bare_percent_at_eol() {
-        // Just % at end of line with nothing after
         assert_eq!(remove_comments("text%\n"), "text");
     }
 
@@ -129,8 +126,6 @@ mod tests {
 
     #[test]
     fn test_comment_preserves_non_ascii() {
-        // This is a simplified test — real UTF-8 handling is covered by
-        // the byte-level scanning
         assert_eq!(remove_comments("café % comment\nworld"), "café world");
     }
 }

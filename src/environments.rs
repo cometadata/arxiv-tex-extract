@@ -18,23 +18,18 @@ static DISPLAY_MATH_OPEN_RE: LazyLock<Regex> =
 static DISPLAY_MATH_CLOSE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\]").unwrap());
 
-/// List environments
 const LIST_ENVS: &[&str] = &[
     "itemize", "enumerate", "description",
-    // paralist package variants
     "compactitem", "compactenum", "compactdesc", "inparaenum",
 ];
 
-/// Figure/table environments (including starred)
 const FLOAT_ENVS: &[&str] = &[
     "figure", "figure*", "table", "table*", "wrapfigure", "wraptable",
     "subfigure", "subfloat", "sidewaysfigure", "sidewaystable",
 ];
 
-/// Quote environments
 const QUOTE_ENVS: &[&str] = &["quote", "quotation", "verse"];
 
-/// Theorem-like environments
 const THEOREM_ENVS: &[&str] = &[
     "theorem", "lemma", "proposition", "corollary", "conjecture",
     "definition", "example", "remark", "proof", "claim", "observation",
@@ -42,46 +37,39 @@ const THEOREM_ENVS: &[&str] = &[
     "question", "problem", "exercise", "solution", "case", "condition",
 ];
 
-/// Tabular environments (content grids with & separators)
 const TABULAR_ENVS: &[&str] = &[
     "tabular", "tabular*", "tabularx", "tabulary",
     "longtable", "longtable*", "supertabular",
     "array",
 ];
 
-/// Math display environments.
-/// Also used by `cleanup::find_math_regions` to protect math content from cleanup transforms.
+/// Also used by `cleanup::find_math_regions` to protect math content from
+/// cleanup transforms.
 pub(crate) const MATH_ENVS: &[&str] = &[
     "equation", "equation*", "align", "align*", "gather", "gather*",
     "multline", "multline*", "eqnarray", "eqnarray*",
     "displaymath", "flalign", "flalign*",
     "alignat", "alignat*",
     "math", "dmath", "dmath*",
-    // Inner amsmath environments
     "split", "cases", "aligned", "gathered", "alignedat",
     "subequations",
-    // Matrix environments
     "pmatrix", "bmatrix", "vmatrix", "Bmatrix", "Vmatrix",
     "smallmatrix", "psmallmatrix", "bsmallmatrix",
 ];
 
-/// Algorithm / pseudocode environments
 const ALGORITHM_ENVS: &[&str] = &[
     "algorithm", "algorithm*", "algorithmic", "algorithm2e",
     "procedure", "function",
 ];
 
-/// Algorithm commands to convert to readable form
 static ALGO_COMMAND_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\\(?:State|If|Else|ElsIf|EndIf|While|EndWhile|For|EndFor|ForAll|EndForAll|Return|Require|Ensure|Input|Output|Procedure|EndProcedure|Function|EndFunction|Loop|EndLoop|Repeat|Until|Comment)\b"
     ).unwrap()
 });
 
-/// Keyword environments
 const KEYWORD_ENVS: &[&str] = &["keywords", "keyword", "IEEEkeywords"];
 
-/// Layout environments (just unwrap to content)
 const LAYOUT_ENVS: &[&str] = &[
     "minipage", "adjustbox", "adjustwidth",
     "spacing", "singlespace", "doublespace", "onehalfspace",
@@ -89,13 +77,11 @@ const LAYOUT_ENVS: &[&str] = &[
     "titlepage", "landscape",
 ];
 
-/// Verbatim / code environments (remove markers, keep content)
 const VERBATIM_ENVS: &[&str] = &["verbatim", "Verbatim", "lstlisting", "minted", "alltt"];
 
-/// Environments to discard entirely (content and markers)
+/// Environments discarded entirely (drawing/diagram envs produce garbage text).
 const DISCARD_ENVS: &[&str] = &[
     "filecontents", "filecontents*",
-    // Drawing / diagram environments (produce garbage text)
     "tikzpicture", "tikzcd", "pgfpicture", "pspicture", "picture",
 ];
 
@@ -174,7 +160,6 @@ pub fn convert_environments(text: &str, custom_theorems: &HashMap<String, String
     result
 }
 
-/// Discard an entire environment (markers + content → nothing).
 fn discard_env(text: &str, env_name: &str) -> String {
     let begin_pat = format!("\\begin{{{}}}", env_name);
     let end_pat = format!("\\end{{{}}}", env_name);
@@ -199,7 +184,6 @@ fn discard_env(text: &str, env_name: &str) -> String {
     result
 }
 
-/// Remove \begin{env} and \end{env} markers, replacing with newlines.
 fn remove_env_markers(text: &str, env_name: &str) -> String {
     let begin_pat = format!("\\begin{{{}}}", env_name);
     let end_pat = format!("\\end{{{}}}", env_name);
@@ -223,7 +207,6 @@ fn remove_env_markers(text: &str, env_name: &str) -> String {
     temp.replace(&end_pat, "\n")
 }
 
-/// Skip trailing `[options]` after an environment begin marker.
 fn skip_optional_trailing(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
     if i < bytes.len() && bytes[i] == b'[' {
@@ -241,7 +224,6 @@ fn skip_optional_trailing(bytes: &[u8], start: usize) -> usize {
     i
 }
 
-/// Convert \item[label] to \n- label
 fn convert_items(text: &str) -> String {
     ITEM_RE
         .replace_all(text, |caps: &regex::Captures| {
@@ -253,7 +235,6 @@ fn convert_items(text: &str) -> String {
         .to_string()
 }
 
-/// Determine the float type category for numbering purposes.
 fn float_type(env_name: &str) -> &str {
     match env_name {
         "figure" | "figure*" | "wrapfigure" | "subfigure" | "subfloat" | "sidewaysfigure" => "figure",
@@ -262,18 +243,16 @@ fn float_type(env_name: &str) -> &str {
     }
 }
 
-/// Process all float environments (figure, table, etc.) as units.
-/// Maintains per-type counters and prepends `Figure N:` / `Table N:` to captions.
+/// Process float environments as units, maintaining per-type counters and
+/// prepending `Figure N:` / `Table N:` to captions.
 fn convert_all_floats(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut last_end = 0;
     let mut counters: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
-    // Find all float begins in order
     let mut search_start = 0;
     while search_start < text.len() {
-        // Find the next float environment begin
-        let mut best_match: Option<(usize, &str, usize)> = None; // (abs_pos, env_name, after_begin)
+        let mut best_match: Option<(usize, &str, usize)> = None;
         for &env in FLOAT_ENVS {
             let begin_pat = format!("\\begin{{{}}}", env);
             if let Some(pos) = text[search_start..].find(&begin_pat) {
@@ -290,7 +269,6 @@ fn convert_all_floats(text: &str) -> String {
             None => break,
         };
 
-        // Find matching \end{env}
         let end_pat = format!("\\end{{{}}}", env_name);
         let content_start = skip_optional_trailing(text.as_bytes(), after_begin);
         if let Some(end_rel) = text[content_start..].find(&end_pat) {
@@ -324,7 +302,6 @@ fn convert_all_floats(text: &str) -> String {
     result
 }
 
-/// Extract `\caption{...}` from float content, prefix with `Figure N:` or `Table N:`.
 fn extract_and_prefix_captions(content: &str, ftype: &str, counter: &mut usize) -> String {
     let pattern = "\\caption";
     let mut result = String::with_capacity(content.len());
@@ -375,7 +352,7 @@ fn extract_and_prefix_captions(content: &str, ftype: &str, counter: &mut usize) 
     result
 }
 
-/// Convert theorem-like environments: \begin{theorem}[name] → **Theorem (name).**
+/// Convert theorem-like environments: \begin{theorem}[name] -> **Theorem (name).**
 fn convert_theorem_env(text: &str, env_name: &str) -> String {
     let begin_pat = format!("\\begin{{{}}}", env_name);
     let begin_pat_star = format!("\\begin{{{}*}}", env_name);
@@ -404,7 +381,6 @@ fn convert_theorem_env(text: &str, env_name: &str) -> String {
 
             let after_ws = skip_ws(result.as_bytes(), after);
             if after_ws < result.len() && result.as_bytes()[after_ws] == b'[' {
-                // Find the closing ]
                 if let Some(close) = result[after_ws + 1..].find(']') {
                     let name = &result[after_ws + 1..after_ws + 1 + close];
                     new_result.push_str(&format!("\n**{} ({}).** ", label, name));
@@ -423,7 +399,6 @@ fn convert_theorem_env(text: &str, env_name: &str) -> String {
         result = new_result;
     }
 
-    // For proof environments, append □ (QED symbol) if not already present
     if env_name == "proof" {
         result = append_qed_to_proof(&result, &end_pat);
         result = append_qed_to_proof(&result, &end_pat_star);
@@ -435,7 +410,6 @@ fn convert_theorem_env(text: &str, env_name: &str) -> String {
     result
 }
 
-/// Replace \end{proof} with " □\n" if the preceding body doesn't contain \qed or \qedsymbol.
 fn append_qed_to_proof(text: &str, end_pat: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut last_end = 0;
@@ -445,7 +419,6 @@ fn append_qed_to_proof(text: &str, end_pat: &str) -> String {
         let abs_pos = search + pos;
         let after = abs_pos + end_pat.len();
 
-        // Check if the text between last_end and abs_pos contains \qed
         let body = &text[last_end..abs_pos];
         let has_qed = body.contains("\\qed") || body.contains("\\qedsymbol");
 
@@ -463,7 +436,6 @@ fn append_qed_to_proof(text: &str, end_pat: &str) -> String {
     result
 }
 
-/// Convert a custom theorem environment using a preamble-defined display name.
 fn convert_custom_theorem_env(text: &str, env_name: &str, display_name: &str) -> String {
     let begin_pat = format!("\\begin{{{}}}", env_name);
     let begin_pat_star = format!("\\begin{{{}*}}", env_name);
@@ -516,7 +488,6 @@ fn skip_ws(bytes: &[u8], pos: usize) -> usize {
     i
 }
 
-/// Replace a numbered math environment with `$$ content (N) $$`.
 fn replace_math_env_numbered(text: &str, env_name: &str, counter: &mut usize) -> String {
     let begin_pat = format!("\\begin{{{}}}", env_name);
     let end_pat = format!("\\end{{{}}}", env_name);
@@ -552,8 +523,8 @@ fn replace_math_env_numbered(text: &str, env_name: &str, counter: &mut usize) ->
     result
 }
 
-/// Clean `&` and `\\[dim]` inside `$$...$$` math display blocks.
-/// Replaces `&` with space and `\\[optional dim]` with newline.
+/// Clean `&` and `\\[dim]` inside `$$...$$` math display blocks: `&` -> space,
+/// `\\[optional dim]` -> newline.
 fn clean_math_display_interiors(text: &str) -> String {
     static MATH_LINE_BREAK_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\\\\(\[[^\]]*\])?").unwrap());
@@ -567,9 +538,7 @@ fn clean_math_display_interiors(text: &str) -> String {
 
         if let Some(close_pos) = text[content_start..].find("\n$$\n") {
             let abs_close = content_start + close_pos;
-            // Copy everything before this $$ block
             result.push_str(&text[search_start..content_start]);
-            // Clean the interior
             let interior = &text[content_start..abs_close];
             let cleaned = interior.replace('&', " ");
             let cleaned = MATH_LINE_BREAK_RE.replace_all(&cleaned, "\n");
@@ -584,15 +553,14 @@ fn clean_math_display_interiors(text: &str) -> String {
     result
 }
 
-/// Replace \begin{env} with open_str and \end{env} with close_str.
 fn replace_env_with(text: &str, env_name: &str, open_str: &str, close_str: &str) -> String {
     let begin_pat = format!("\\begin{{{}}}", env_name);
     let end_pat = format!("\\end{{{}}}", env_name);
     text.replace(&begin_pat, open_str).replace(&end_pat, close_str)
 }
 
-/// Skip trailing braced groups `{...}` and optional brackets `[...]` after an
-/// environment begin marker. Used for `\begin{tabular}{col_spec}` and
+/// Skip trailing braced groups and optional brackets after an environment
+/// begin marker. Used for `\begin{tabular}{col_spec}` and
 /// `\begin{thebibliography}{widest-label}`.
 fn skip_trailing_braces_and_options(bytes: &[u8], start: usize) -> usize {
     let mut i = start;
@@ -623,8 +591,6 @@ fn skip_trailing_braces_and_options(bytes: &[u8], start: usize) -> usize {
     i
 }
 
-/// Convert tabular environments: strip markers (including column spec),
-/// replace `&` column separators with spaces.
 fn convert_tabular_env(text: &str, env_name: &str) -> String {
     let begin_pat = format!("\\begin{{{}}}", env_name);
     let end_pat = format!("\\end{{{}}}", env_name);
@@ -661,7 +627,6 @@ fn convert_tabular_env(text: &str, env_name: &str) -> String {
     result
 }
 
-/// Convert `\begin{thebibliography}{widest-label}` to a References header.
 fn convert_bibliography_env(text: &str) -> String {
     let begin_pat = "\\begin{thebibliography}";
     let end_pat = "\\end{thebibliography}";
@@ -687,7 +652,6 @@ fn convert_bibliography_env(text: &str) -> String {
     result.replace(end_pat, "\n")
 }
 
-/// Convert `\begin{keywords}` → `**Keywords:** ` prefix.
 fn convert_keyword_env(text: &str, env_name: &str) -> String {
     let begin_pat = format!("\\begin{{{}}}", env_name);
     let end_pat = format!("\\end{{{}}}", env_name);
@@ -695,8 +659,8 @@ fn convert_keyword_env(text: &str, env_name: &str) -> String {
         .replace(&end_pat, "\n")
 }
 
-/// Remove `\begin{env}` markers, consuming trailing braced/optional args
-/// (needed for environments like `\begin{minipage}{0.5\textwidth}`).
+/// Remove markers, consuming trailing braced/optional args (needed for
+/// environments like `\begin{minipage}{0.5\textwidth}`).
 fn remove_env_markers_with_args(text: &str, env_name: &str) -> String {
     let begin_pat = format!("\\begin{{{}}}", env_name);
     let end_pat = format!("\\end{{{}}}", env_name);
@@ -719,7 +683,6 @@ fn remove_env_markers_with_args(text: &str, env_name: &str) -> String {
     result.replace(&end_pat, "\n")
 }
 
-/// Remove remaining \begin{...} and \end{...} for unrecognized environments.
 fn remove_remaining_envs(text: &str) -> String {
     static BEGIN_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\\begin\{[^{}]*\}(?:\{[^{}]*\})*(?:\[[^\]]*\])?").unwrap());
@@ -985,8 +948,6 @@ mod tests {
         assert!(result.contains("**Corollary.**"), "custom theorem: {result}");
     }
 
-    // --- Stage 5a: proof QED ---
-
     #[test]
     fn test_proof_qed_appended() {
         let input = r"\begin{proof}This is a proof.\end{proof}";
@@ -1009,8 +970,6 @@ mod tests {
         let result = ce(input);
         assert!(!result.contains("\u{25A1}"), "should not add QED when \\qedsymbol present: {result}");
     }
-
-    // --- Stage 5b: discard environments ---
 
     #[test]
     fn test_filecontents_discarded() {
