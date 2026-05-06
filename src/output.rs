@@ -14,7 +14,6 @@ use parquet::file::properties::WriterProperties;
 use crate::checkpoint;
 use crate::result::ExtractionResult;
 
-/// Build the Arrow schema for extraction results.
 pub fn result_schema() -> Schema {
     Schema::new(vec![
         Field::new("arxiv_id", DataType::Utf8, false),
@@ -527,7 +526,6 @@ mod tests {
         assert_eq!(shards.len(), 1);
         assert!(shards[0].ends_with("test.parquet"));
 
-        // Read back and verify
         let file = File::open(&shards[0]).unwrap();
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)
             .unwrap()
@@ -543,13 +541,11 @@ mod tests {
     #[test]
     fn test_shard_splitting() {
         let dir = tempfile::tempdir().unwrap();
-        // max_rows = 2 to force splitting
         let mut writer =
             ParquetShardWriter::new(dir.path(), "split", 2, 256_000_000, usize::MAX);
 
         writer.write(make_result("a", "text1")).unwrap();
         writer.write(make_result("b", "text2")).unwrap();
-        // This should have triggered a flush (2 rows = max_rows)
         writer.write(make_result("c", "text3")).unwrap();
 
         let shards = writer.finish().unwrap();
@@ -589,9 +585,8 @@ mod tests {
 
     #[test]
     fn writer_flushes_incrementally_within_shard() {
-        // With a 256-row micro-batch and a 5000-row shard, writing 300 rows
-        // must flush at least one micro-batch — so the in-memory buffer
-        // is < MICRO_BATCH_ROWS.
+        // 256-row micro-batch + 5000-row shard: writing 300 rows
+        // must flush at least one micro-batch.
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
             ParquetShardWriter::new(dir.path(), "mb", 5000, usize::MAX, usize::MAX);
@@ -604,10 +599,8 @@ mod tests {
             writer.micro_buffer_len()
         );
         let shards = writer.finish().unwrap();
-        // Single shard produced — we didn't cross 5000 rows.
         assert_eq!(shards.len(), 1);
 
-        // Read back and confirm all 300 rows landed.
         let file = File::open(&shards[0]).unwrap();
         let reader = ParquetRecordBatchReaderBuilder::try_new(file)
             .unwrap()
@@ -620,7 +613,6 @@ mod tests {
 
     #[test]
     fn test_papers_per_shard_rotates_independent_of_max_rows() {
-        // max_rows is generous; papers_per_shard=3 should drive rotation.
         let dir = tempfile::tempdir().unwrap();
         let mut writer = ParquetShardWriter::new(dir.path(), "pps", 1_000_000, usize::MAX, 3);
 
@@ -644,7 +636,6 @@ mod tests {
 
         writer.write(&make_result("a", "one")).unwrap();
         writer.write(&make_result("b", "two")).unwrap();
-        // 2 rows → rotate; third write goes into the next shard.
         writer.write(&make_result("c", "three")).unwrap();
 
         let shards = writer.finish().unwrap();
@@ -652,13 +643,11 @@ mod tests {
         assert!(shards[0].ends_with("jshard.jsonl"));
         assert!(shards[1].ends_with("jshard_001.jsonl"));
 
-        // No .tmp leftovers.
         for entry in fs::read_dir(dir.path()).unwrap() {
             let name = entry.unwrap().file_name().to_string_lossy().to_string();
             assert!(!name.ends_with(".tmp"), "temp file left: {name}");
         }
 
-        // First shard has 2 lines, second has 1.
         let first = std::fs::read_to_string(&shards[0]).unwrap();
         let second = std::fs::read_to_string(&shards[1]).unwrap();
         assert_eq!(first.lines().count(), 2);
@@ -695,8 +684,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cp = dir.path().join("checkpoint.log");
 
-        // papers_per_shard=2 → rotate twice with 5 writes, third shard stays
-        // in-flight until finish().
         let mut writer = ParquetShardWriter::new(dir.path(), "mytar", 1000, usize::MAX, 2)
             .with_checkpoint(Some(cp.clone()));
         for i in 0..5 {
@@ -704,7 +691,6 @@ mod tests {
                 .write(make_result(&format!("2401.{i:05}"), "x"))
                 .unwrap();
         }
-        // After two rotations (at 2 and 4 papers), 4 IDs should be fsynced.
         let mid = std::fs::read_to_string(&cp).unwrap();
         let mid_lines: Vec<&str> = mid.lines().collect();
         assert_eq!(mid_lines.len(), 4, "expected 4 lines mid-run, got: {mid}");
@@ -712,7 +698,6 @@ mod tests {
             assert!(line.starts_with("mytar\t"), "bad line: {line}");
         }
 
-        // finish() closes the 5th (trailing) shard and flushes its ID.
         writer.finish().unwrap();
         let final_content = std::fs::read_to_string(&cp).unwrap();
         assert_eq!(final_content.lines().count(), 5);
@@ -728,7 +713,6 @@ mod tests {
         for i in 0..3 {
             writer.write(&make_result(&format!("2401.{i:05}"), "x")).unwrap();
         }
-        // One rotation at 2 papers → 2 IDs fsynced before finish.
         let mid = std::fs::read_to_string(&cp).unwrap();
         assert_eq!(mid.lines().count(), 2);
 

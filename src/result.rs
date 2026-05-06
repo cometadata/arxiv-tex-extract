@@ -1,6 +1,5 @@
 use serde::Serialize;
 
-/// Source file type detected from archive content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileType {
@@ -69,7 +68,6 @@ pub struct ExtractionResult {
 }
 
 impl ExtractionResult {
-    /// Convenience constructor for error/skip results.
     pub fn error(arxiv_id: String, source_tar: Option<String>, status: &str, error: String) -> Self {
         Self {
             arxiv_id,

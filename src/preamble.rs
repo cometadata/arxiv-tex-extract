@@ -1,10 +1,8 @@
 use crate::braces::find_braced_group;
 use crate::comments::remove_comments;
 
-/// Extract footnote-like content from the preamble (before \begin{document}).
-///
-/// Collects text from \thanks{...}, \footnote{...}, and \footnotetext{...}
-/// that appear before \begin{document}.
+/// Extract footnote-like content (\thanks, \footnote, \footnotetext, \funding)
+/// from the preamble before \begin{document}.
 pub fn extract_preamble_extras(file_content: &str) -> Vec<String> {
     let mut extras = Vec::new();
 
@@ -24,8 +22,8 @@ pub fn extract_preamble_extras(file_content: &str) -> Vec<String> {
 
             let bytes = preamble.as_bytes();
             if after_cmd < bytes.len() && bytes[after_cmd].is_ascii_alphabetic() {
-                // \footnotetext starts with \footnote, so only skip longer names
-                // for commands other than \footnotetext itself
+                // \footnotetext starts with \footnote: only skip longer names for
+                // commands other than \footnotetext itself.
                 if *cmd != "\\footnotetext" {
                     search_start = after_cmd;
                     continue;
@@ -57,8 +55,9 @@ pub fn extract_preamble_extras(file_content: &str) -> Vec<String> {
     extras
 }
 
-/// Return byte ranges (start, end) of `\title{...}` and `\author{...}` blocks
-/// that were extracted from the preamble, so nested `\thanks` can be skipped.
+/// Byte ranges of `\title{...}` and `\author{...}` blocks extracted from the
+/// preamble, so nested `\thanks` inside them can be skipped to avoid
+/// duplication.
 fn extract_preamble_metadata_ranges(file_content: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
 
@@ -103,8 +102,6 @@ fn extract_preamble_metadata_ranges(file_content: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// Like `extract_preamble_extras` but skips commands whose position falls
-/// inside one of the given ranges (e.g., `\thanks` nested inside `\author{...}`).
 fn extract_preamble_extras_excluding(
     file_content: &str,
     exclude_ranges: &[(usize, usize)],
@@ -166,7 +163,6 @@ fn extract_preamble_extras_excluding(
     extras
 }
 
-/// Extract a simple `\command{content}` from preamble text, pushing matches to `items`.
 fn extract_simple_command(preamble: &str, cmd: &str, items: &mut Vec<String>) {
     let mut search_start = 0;
     while let Some(pos) = preamble[search_start..].find(cmd) {
@@ -186,9 +182,8 @@ fn extract_simple_command(preamble: &str, cmd: &str, items: &mut Vec<String>) {
     }
 }
 
-/// Extract `\title{...}` and `\author{...}` from the preamble when they
-/// appear before `\begin{document}` (common in amsart, amsmath classes).
-/// Returns formatted lines to prepend to the body.
+/// Extract `\title{...}` and `\author{...}` (plus related metadata) from the
+/// preamble when they appear before `\begin{document}` (common in amsart).
 fn extract_preamble_metadata(file_content: &str) -> Vec<String> {
     let mut items = Vec::new();
 
@@ -400,14 +395,12 @@ fn extract_preamble_metadata(file_content: &str) -> Vec<String> {
         }
     }
 
-    // Extract \inst{...} (JPSJ class: institution/affiliation block in preamble)
-    // Only extract when it appears standalone (not after \author on the same line),
-    // i.e., when there is no preceding \institute (Springer class uses \inst differently).
+    // Skip \inst when \institute is present (Springer class uses \inst as inline
+    // affiliation indices inside \institute, not as a standalone preamble block).
     if !preamble.contains("\\institute") {
         extract_simple_command(preamble, "\\inst", &mut items);
     }
 
-    // Extract \abst{...} (JPSJ class: abstract as preamble command)
     {
         let mut search_start = 0;
         while let Some(pos) = preamble[search_start..].find("\\abst") {
@@ -416,7 +409,6 @@ fn extract_preamble_metadata(file_content: &str) -> Vec<String> {
             let bytes = preamble.as_bytes();
             // Boundary: \abst not \abstract
             if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
-                // Allow \abst followed by '{' or whitespace, but not \abstract
                 let rest = &preamble[after..];
                 if !rest.starts_with('{') {
                     search_start = after;
@@ -457,7 +449,6 @@ fn extract_preamble_metadata(file_content: &str) -> Vec<String> {
     items
 }
 
-/// Build a map from `\address[label]` optional-arg labels to sequential indices.
 fn build_address_label_map(preamble: &str) -> std::collections::HashMap<String, usize> {
     let mut map = std::collections::HashMap::new();
     let mut idx = 0usize;
@@ -490,7 +481,6 @@ fn build_address_label_map(preamble: &str) -> std::collections::HashMap<String, 
     map
 }
 
-/// Extract optional `[content]` returning `(Some(content), pos_after)` or `(None, original_pos)`.
 fn extract_optional_bracket(text: &str, pos: usize) -> (Option<String>, usize) {
     let bytes = text.as_bytes();
     let mut i = pos;
@@ -518,8 +508,6 @@ fn extract_optional_bracket(text: &str, pos: usize) -> (Option<String>, usize) {
     }
 }
 
-/// Skip optional `[...]` argument after whitespace. Returns position after `]`
-/// or unchanged `pos` if no `[` found.
 fn skip_optional_bracket(text: &str, pos: usize) -> usize {
     let bytes = text.as_bytes();
     let mut i = pos;
@@ -542,8 +530,6 @@ fn skip_optional_bracket(text: &str, pos: usize) -> usize {
     if depth == 0 { i } else { pos }
 }
 
-/// Skip whitespace after `pos` and extract the content of the next `{...}` group.
-/// Returns `Some((content_start, content_end))`.
 fn extract_braced_after(text: &str, pos: usize) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut i = pos;
@@ -563,7 +549,6 @@ fn find_end_document(text: &str) -> Option<usize> {
     let mut search_start = 0;
     while let Some(pos) = text[search_start..].find(target) {
         let abs_pos = search_start + pos;
-        // Walk backward to the start of the line
         let line_start = text[..abs_pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let before = text[line_start..abs_pos].trim_start();
         if !before.starts_with('%') {
@@ -576,10 +561,8 @@ fn find_end_document(text: &str) -> Option<usize> {
 
 /// Extract the document body between \begin{document} and \end{document}.
 /// Returns (preamble_extras, body). If no \begin{document} is found, returns
-/// the entire content as the body.
-///
-/// Preamble extras include \thanks/\footnote content and, when \title/\author
-/// appear only in the preamble (e.g. amsart class), those metadata items.
+/// the entire content as the body. Preamble extras include \thanks/\footnote
+/// content plus \title/\author metadata when only present in the preamble.
 pub fn extract_body(file_content: &str) -> (Vec<String>, String) {
     let mut extras = Vec::new();
     extras.extend(extract_preamble_metadata(file_content));
@@ -667,7 +650,6 @@ mod tests {
 
     #[test]
     fn test_preamble_title_not_duplicated() {
-        // If \title is in the body too, don't extract from preamble
         let input = r"\title{Preamble Title}\begin{document}\title{Body Title}text\end{document}";
         let (extras, _) = extract_body(input);
         assert!(!extras.iter().any(|e| e.contains("Preamble Title")),
@@ -710,7 +692,6 @@ mod tests {
 
     #[test]
     fn test_preamble_affiliation_not_affiliations() {
-        // \affiliations (plural) should still work and not be duplicated
         let input = r"\affiliations{Group Affil}\affiliation{Single Affil}\begin{document}body\end{document}";
         let (extras, _) = extract_body(input);
         assert!(extras.iter().any(|e| e.contains("Group Affil")),
@@ -764,7 +745,6 @@ mod tests {
 
     #[test]
     fn test_text_before_percent_on_same_line() {
-        // % after non-comment text on the same line — \end{document} is still valid
         let input = "\\begin{document}body text % comment\n\\end{document}\nextra";
         let (_, body) = extract_body(input);
         assert_eq!(body, "body text % comment\n");

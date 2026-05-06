@@ -6,10 +6,8 @@ use std::sync::Arc;
 
 /// A paper extracted from an arXiv archive.
 ///
-/// `tex_files` is wrapped in `Arc` so that handing the files to a worker
-/// thread (src/main.rs `extract_with_timeout`) and to the panic-isolated
-/// pipeline (`process_paper`) is a cheap refcount bump instead of a deep
-/// Vec<TexFile> clone — previously ~5 MB per paper at both sites.
+/// `tex_files` is wrapped in `Arc` so handing the files across thread
+/// boundaries is a refcount bump instead of a deep Vec<TexFile> clone.
 pub struct PaperArchive {
     pub arxiv_id: String,
     pub tex_files: Arc<Vec<TexFile>>,
@@ -20,7 +18,6 @@ pub struct PaperArchive {
 /// Maximum decompressed size per archive (100MB).
 const MAX_DECOMPRESSED_SIZE: u64 = 100_000_000;
 
-/// Detect file type from the first bytes of decompressed content.
 fn detect_file_type(bytes: &[u8]) -> FileType {
     if bytes.is_empty() {
         return FileType::Unknown;
@@ -42,7 +39,6 @@ fn detect_file_type(bytes: &[u8]) -> FileType {
     }
 }
 
-/// Decompress gz bytes and classify: if tex, return the tex file; otherwise return the detected type.
 fn classify_gz(raw: &[u8], arxiv_id: &str) -> (Vec<TexFile>, FileType) {
     match decompress_gz(raw, arxiv_id) {
         Ok(decompressed) => {
@@ -110,8 +106,7 @@ pub fn for_each_paper(
             Err(_) => continue,
         };
 
-        // Skip directory entries (e.g. "2603/") — they are tar metadata,
-        // not paper submissions.
+        // Skip directory entries (tar metadata, not paper submissions).
         if path.ends_with('/') {
             continue;
         }
@@ -138,8 +133,6 @@ pub fn classify_by_extension(path: &str) -> FileType {
     }
 }
 
-/// Extract all papers from an outer tar file into a Vec.
-///
 /// Convenience wrapper around `for_each_paper` for cases where collecting
 /// all results is acceptable (testing, small archives).
 pub fn iter_papers(reader: impl Read) -> Vec<Result<PaperArchive>> {
@@ -148,10 +141,9 @@ pub fn iter_papers(reader: impl Read) -> Vec<Result<PaperArchive>> {
     results
 }
 
-/// Process a single entry from the outer tar.
 fn process_entry<R: Read>(mut entry: tar::Entry<R>, arxiv_id: &str, path: &str) -> Result<PaperArchive> {
-    // Guard: skip entries whose raw size already exceeds the decompression
-    // limit. Prevents reading huge compressed blobs into memory.
+    // Skip entries whose raw size already exceeds the decompression limit
+    // to avoid reading huge compressed blobs into memory.
     let raw_size = entry.header().size().unwrap_or(0);
     if raw_size > MAX_DECOMPRESSED_SIZE {
         anyhow::bail!(
@@ -170,8 +162,8 @@ fn process_entry<R: Read>(mut entry: tar::Entry<R>, arxiv_id: &str, path: &str) 
     let (tex_files, file_type) = if path.ends_with(".pdf") {
         (Vec::new(), FileType::Pdf)
     } else if path.ends_with(".tar.gz") || path.ends_with(".tgz") || path.ends_with(".gz") {
-        // Try as gzipped tar first. Old arXiv .gz entries are often gzipped
-        // tar archives (multi-file submissions) despite the plain .gz extension.
+        // Old arXiv .gz entries are often gzipped tar archives (multi-file
+        // submissions) despite the plain .gz extension, so try tar first.
         match extract_inner_tar_gz(&raw_bytes, arxiv_id) {
             Ok(files) if !files.is_empty() => (files, FileType::Tex),
             _ => classify_gz(&raw_bytes, arxiv_id),
@@ -190,7 +182,6 @@ fn process_entry<R: Read>(mut entry: tar::Entry<R>, arxiv_id: &str, path: &str) 
     })
 }
 
-/// Extract .tex files from an inner .tar.gz archive.
 fn extract_inner_tar_gz(raw: &[u8], arxiv_id: &str) -> Result<Vec<TexFile>> {
     let gz = flate2::read::GzDecoder::new(raw);
     let limited = gz.take(MAX_DECOMPRESSED_SIZE);
@@ -237,7 +228,6 @@ fn extract_inner_tar_gz(raw: &[u8], arxiv_id: &str) -> Result<Vec<TexFile>> {
     Ok(tex_files)
 }
 
-/// Decompress a .gz archive to raw bytes.
 fn decompress_gz(raw: &[u8], arxiv_id: &str) -> Result<Vec<u8>> {
     let gz = flate2::read::GzDecoder::new(raw);
     let mut limited = gz.take(MAX_DECOMPRESSED_SIZE);
@@ -250,7 +240,6 @@ fn decompress_gz(raw: &[u8], arxiv_id: &str) -> Result<Vec<u8>> {
     Ok(content_bytes)
 }
 
-/// Extract a single .tex file from raw bytes.
 fn extract_single_tex(raw: &[u8], path: &str) -> Result<Vec<TexFile>> {
     if let Some(content) = decode_bytes(raw) {
         Ok(vec![TexFile {
@@ -263,6 +252,7 @@ fn extract_single_tex(raw: &[u8], path: &str) -> Result<Vec<TexFile>> {
 }
 
 /// Decode bytes to string: try UTF-8, then fall back to Latin-1.
+/// Strips a leading UTF-8 BOM if present.
 fn decode_bytes(bytes: &[u8]) -> Option<String> {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return Some(s.strip_prefix('\u{FEFF}').unwrap_or(s).to_string());
@@ -292,7 +282,6 @@ fn derive_arxiv_id(path: &str) -> String {
         .to_string()
 }
 
-/// Process a single per-paper archive file (for testing / single-file mode).
 pub fn load_paper_archive(file_path: &std::path::Path) -> Result<PaperArchive> {
     let arxiv_id = derive_arxiv_id(
         file_path
@@ -326,7 +315,6 @@ pub fn load_paper_archive(file_path: &std::path::Path) -> Result<PaperArchive> {
     Ok(PaperArchive { arxiv_id, tex_files: Arc::new(tex_files), file_type, entry_name: path_str })
 }
 
-/// Try to extract .tex files from raw bytes treated as a tar archive.
 fn extract_from_tar(raw: &[u8], _arxiv_id: &str) -> Result<Vec<TexFile>> {
     let mut archive = tar::Archive::new(raw);
     let mut tex_files = Vec::new();
@@ -374,7 +362,6 @@ mod tests {
 
     #[test]
     fn test_decode_latin1() {
-        // Latin-1 encoded "café" (é = 0xe9 in Latin-1)
         let bytes = vec![0x63, 0x61, 0x66, 0xe9];
         let result = decode_bytes(&bytes).unwrap();
         assert!(result.contains("caf"));
@@ -382,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_decode_utf8_bom() {
-        let mut bytes = vec![0xEF, 0xBB, 0xBF]; // BOM
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice("hello".as_bytes());
         assert_eq!(decode_bytes(&bytes).unwrap(), "hello");
     }
@@ -437,10 +424,6 @@ mod tests {
 
     #[test]
     fn test_for_each_paper_passes_arxiv_id_on_error() {
-        // Build an in-memory tar with a single entry whose header claims a
-        // size that exceeds MAX_DECOMPRESSED_SIZE (100 MB). `process_entry`
-        // bails on the size check, so `for_each_paper` yields `Err` for
-        // this entry — and must pass the derived arxiv_id alongside it.
         let buf: Vec<u8> = Vec::new();
         let mut tar_builder = tar::Builder::new(buf);
         let mut header = tar::Header::new_gnu();

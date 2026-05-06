@@ -24,7 +24,6 @@ impl StageTimings {
         result
     }
 
-    /// Total pipeline time in microseconds.
     pub fn total_us(&self) -> u64 {
         self.entries.iter().map(|(_, us)| us).sum()
     }
@@ -39,7 +38,6 @@ impl StageTimings {
         format!("{{{}}}", pairs.join(","))
     }
 
-    /// Get entries as a slice.
     pub fn entries(&self) -> &[(&'static str, u64)] {
         &self.entries
     }

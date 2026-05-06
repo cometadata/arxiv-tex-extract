@@ -18,7 +18,6 @@ use crate::timing::StageTimings;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// State threaded through the pipeline to share data between stages.
 pub struct PipelineContext {
     pub macros: HashMap<String, String>,
     pub parametric_macros: Vec<ParametricMacro>,
@@ -26,16 +25,13 @@ pub struct PipelineContext {
     pub section_label_map: HashMap<String, String>,
 }
 
-/// Output of the timed extraction pipeline.
 pub struct ExtractionOutput {
     pub text: Option<String>,
     pub timings: StageTimings,
 }
 
 /// Run the full extraction pipeline on a collection of .tex files.
-///
 /// Returns the extracted text, or None if extraction produces empty output.
-/// This is the original API — timing data is discarded.
 pub fn extract_text(tex_files: &[TexFile]) -> Option<String> {
     extract_text_timed(tex_files).text
 }
@@ -108,13 +104,9 @@ pub fn extract_text_timed_cancellable(
     ExtractionOutput { text, timings }
 }
 
-/// Convert a single .tex file to clean readable text.
-///
-/// Timings are passed separately from the pipeline context to avoid
-/// borrow-checker conflicts: `timings.time()` borrows `timings` mutably,
-/// while the closures inside need shared borrows of `ctx.macros`,
-/// `ctx.section_label_map`, etc. Keeping them in separate variables lets
-/// the borrow checker see there is no overlap.
+// Timings are passed separately from the pipeline context because
+// `timings.time()` borrows `timings` mutably while the closures inside
+// need shared borrows of `ctx.macros`, `ctx.section_label_map`, etc.
 fn clean_tex_file(
     file_content: &str,
     ctx: &mut PipelineContext,

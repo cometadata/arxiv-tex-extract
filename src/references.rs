@@ -7,7 +7,6 @@ use std::sync::LazyLock;
 static LABEL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\label\{[^{}]*\}").unwrap());
 
-/// Common astronomy / physics journal abbreviation macros.
 static JOURNAL_MACROS: LazyLock<CommandReplacer> = LazyLock::new(|| {
     CommandReplacer::new(&[
         ("\\aap", "A&A"),
@@ -33,10 +32,8 @@ static JOURNAL_MACROS: LazyLock<CommandReplacer> = LazyLock::new(|| {
     ])
 });
 
-/// Scan `\bibitem{key}` entries in document order and build a key → display text map.
-/// Detects author-year mode: if any `\bibitem[label]{key}` has a non-numeric optional
-/// label (e.g., `Smith et al., 2020`), uses those labels as display text.
-/// Otherwise falls back to sequential numeric indices.
+/// Build a key → display text map from `\bibitem{key}` entries.
+/// Author-year mode if any optional label is non-numeric; otherwise sequential numeric indices.
 fn build_cite_key_map(text: &str) -> HashMap<String, String> {
     let pattern = "\\bibitem";
 
@@ -96,8 +93,8 @@ fn build_cite_key_map(text: &str) -> HashMap<String, String> {
     map
 }
 
-/// Scan `\label{key}` entries in document order and build a key → display number map.
-/// Keys are split on `:` for type prefix; per-prefix counters (fig, eq, sec, tab, thm, etc.).
+/// Build a key → display number map from `\label{key}` entries.
+/// Keys split on `:` get per-prefix counters (fig, eq, sec, tab, thm, etc.).
 fn build_label_map(text: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let mut prefix_counters: HashMap<String, usize> = HashMap::new();
@@ -177,7 +174,7 @@ fn replace_cite_commands(text: &str, cite_map: &HashMap<String, String>) -> Stri
     let mut search_start = 0;
     while let Some(pos) = text[search_start..].find("\\cite") {
         let abs_pos = search_start + pos;
-        let mut cmd_end = abs_pos + 5; // after "\cite"
+        let mut cmd_end = abs_pos + 5;
         let bytes = text.as_bytes();
 
         let suffix_start = cmd_end;
@@ -197,7 +194,7 @@ fn replace_cite_commands(text: &str, cite_map: &HashMap<String, String>) -> Stri
             cmd_end += 1;
         }
 
-        // Skip optional arguments (natbib allows two: \citep[see][p.~5]{key})
+        // natbib allows two optional args: \citep[see][p.~5]{key}
         let after_opt = skip_optional_arg(text, cmd_end);
         let after_opt = skip_optional_arg(text, after_opt);
 
@@ -228,7 +225,6 @@ fn replace_cite_commands(text: &str, cite_map: &HashMap<String, String>) -> Stri
     result
 }
 
-/// Replace \ref{label} → resolved number (or raw label if not found).
 fn replace_ref_command(text: &str, cmd_name: &str, label_map: &HashMap<String, String>) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());
@@ -263,7 +259,6 @@ fn replace_ref_command(text: &str, cmd_name: &str, label_map: &HashMap<String, S
     result
 }
 
-/// Replace \url{...} → URL text.
 fn replace_url_command(text: &str) -> String {
     let pattern = "\\url";
     let mut result = String::with_capacity(text.len());
@@ -294,7 +289,6 @@ fn replace_url_command(text: &str) -> String {
     result
 }
 
-/// Replace \bibitem[label]{key} → \n[N] (clean bibliography entry separator).
 fn convert_bibitems(text: &str, cite_map: &HashMap<String, String>) -> String {
     let pattern = "\\bibitem";
     let mut result = String::with_capacity(text.len());
@@ -306,7 +300,6 @@ fn convert_bibitems(text: &str, cite_map: &HashMap<String, String>) -> String {
         let after = abs_pos + pattern.len();
         let bytes = text.as_bytes();
 
-        // Boundary check: not followed by alpha (e.g., \bibitemize)
         if after < bytes.len() && bytes[after].is_ascii_alphabetic() {
             search_start = after;
             continue;
@@ -337,7 +330,6 @@ fn convert_bibitems(text: &str, cite_map: &HashMap<String, String>) -> String {
     result
 }
 
-/// Replace \hyperref[label]{text} → text (extract braced argument, skip optional label).
 fn replace_hyperref_command(text: &str) -> String {
     let pattern = "\\hyperref";
     let mut result = String::with_capacity(text.len());
@@ -369,7 +361,6 @@ fn replace_hyperref_command(text: &str) -> String {
     result
 }
 
-/// Replace \href{url}{text} → text (extract second argument).
 fn replace_href_command(text: &str) -> String {
     let pattern = "\\href";
     let mut result = String::with_capacity(text.len());
@@ -447,7 +438,6 @@ mod tests {
 
     #[test]
     fn test_bibitem_displays_author_year_label() {
-        // Non-numeric optional label triggers author-year mode
         let input = r"\bibitem[Smith2020]{smith2020} A reference.";
         let result = cr(input);
         assert!(result.contains("[Smith2020]"), "bibitem should display author-year label: {result}");
@@ -532,7 +522,6 @@ mod tests {
 
     #[test]
     fn test_citep_two_optional_args() {
-        // natbib: \citep[see][p.~5]{key} has two optional args
         let input = r"\citep[see][p.~5]{smith2020} \bibitem{smith2020} S.";
         let result = cr(input);
         assert!(result.contains("[1]"), "citep with two optional args should resolve: {result}");
@@ -547,7 +536,6 @@ mod tests {
 
     #[test]
     fn test_numeric_optional_stays_numeric() {
-        // When optional args are just numbers, stay in numeric mode
         let input = r"\cite{a} \bibitem[1]{a} A. \bibitem[2]{b} B.";
         let result = cr(input);
         assert!(result.contains("[1]"), "numeric mode cite: {result}");

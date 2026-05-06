@@ -6,15 +6,12 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use tracing::info;
 
-/// Maximum sample IDs to collect per error category.
 const MAX_SAMPLES: usize = 5;
 
 /// Type-safe classification of every document's extraction result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// Successful extraction
     Ok,
-    /// No tex files or extraction produced empty text
     Empty,
     /// Combined .tex content exceeds size limit
     Skipped,
@@ -22,7 +19,6 @@ pub enum Outcome {
     /// Distinct from `Skipped` (which is a size-cap reject) so resume behaviour
     /// doesn't inflate the "skipped due to size" category in telemetry.
     SkippedResume,
-    /// Per-document extraction timeout
     Timeout,
     /// Extraction pipeline panicked (catch_unwind)
     Panic,
@@ -34,7 +30,6 @@ pub enum Outcome {
     IoError,
 }
 
-/// Tracks count and sample IDs for a single error category.
 #[derive(Debug, Clone, Default)]
 pub struct CategoryDetail {
     pub count: u64,
@@ -74,7 +69,6 @@ pub struct StatusCounts {
 }
 
 impl StatusCounts {
-    /// Record an outcome for a given document.
     pub fn record(&mut self, outcome: Outcome, id: &str) {
         match outcome {
             Outcome::Ok => self.ok += 1,
@@ -89,7 +83,6 @@ impl StatusCounts {
         }
     }
 
-    /// Merge counts from another instance.
     pub fn merge(&mut self, other: &StatusCounts) {
         self.ok += other.ok;
         self.empty.merge(&other.empty);
@@ -114,7 +107,6 @@ impl StatusCounts {
             + self.archive_errors.count
     }
 
-    /// Emit structured info! lines with counts and sample IDs.
     pub fn log_summary(&self, prefix: &str) {
         info!("{} ({} ok)", prefix, self.ok);
         log_category("timeouts", &self.timeouts);
@@ -145,7 +137,6 @@ fn log_category(label: &str, detail: &CategoryDetail) {
     }
 }
 
-/// Per-tar processing metrics.
 #[derive(Debug, Serialize)]
 pub struct TarMetrics {
     pub tar_name: String,
@@ -163,7 +154,6 @@ pub struct TarMetrics {
 }
 
 impl TarMetrics {
-    /// Construct from a StatusCounts snapshot.
     pub fn from_counts(tar_name: String, counts: &StatusCounts, processing_time_ms: u64) -> Self {
         Self {
             tar_name,
@@ -290,7 +280,6 @@ mod tests {
         counts.record(Outcome::Panic, "p1");
         counts.record(Outcome::IoError, "io1");
 
-        // total excludes io_errors
         assert_eq!(counts.total(), 4);
     }
 
@@ -305,7 +294,7 @@ mod tests {
 
         let m = TarMetrics::from_counts("test.tar".into(), &counts, 5000);
         assert_eq!(m.tar_name, "test.tar");
-        assert_eq!(m.total_papers, 4); // io_errors excluded
+        assert_eq!(m.total_papers, 4);
         assert_eq!(m.ok, 1);
         assert_eq!(m.timeouts, 1);
         assert_eq!(m.panics, 1);

@@ -568,7 +568,6 @@ static GREEK_LETTERS: LazyLock<CommandReplacer> = LazyLock::new(|| {
 });
 
 /// Map `\mathbb{X}` or `\Bbb{X}` to Unicode double-struck characters.
-/// Full A-Z, a-z, 0-9 mapping.
 fn convert_mathbb(text: &str) -> String {
     static MATHBB_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\\(?:mathbb|Bbb)\{([A-Za-z0-9])\}").unwrap());
@@ -601,7 +600,6 @@ fn mathbb_char(ch: char) -> char {
     }
 }
 
-/// Map `\mathcal{X}` or `\mathscr{X}` to Unicode script characters.
 fn convert_mathcal_mathscr(text: &str) -> String {
     static RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\\math(?:cal|scr)\{([A-Za-z])\}").unwrap());
@@ -638,7 +636,6 @@ fn mathscript_char(ch: char) -> char {
     }
 }
 
-/// Map `\mathfrak{X}` to Unicode fraktur characters.
 fn convert_mathfrak(text: &str) -> String {
     static RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\\mathfrak\{([A-Za-z])\}").unwrap());
@@ -667,7 +664,6 @@ fn mathfrak_char(ch: char) -> char {
     }
 }
 
-/// Map `\mathsf{X}` to Unicode sans-serif characters.
 fn convert_mathsf(text: &str) -> String {
     static RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\\mathsf\{([A-Za-z])\}").unwrap());
@@ -688,7 +684,6 @@ fn mathsf_char(ch: char) -> char {
     }
 }
 
-/// Map `\mathtt{X}` to Unicode monospace characters.
 fn convert_mathtt(text: &str) -> String {
     static RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\\mathtt\{([A-Za-z0-9])\}").unwrap());
@@ -743,10 +738,9 @@ fn replace_inverted_punct(text: &str) -> String {
 
 /// Convert LaTeX symbol commands and ligatures to Unicode.
 pub fn convert_symbols(text: &str) -> String {
-    // Inverted punctuation before ligature conversion
+    // Inverted punctuation must run before ligature conversion
     let mut result = replace_inverted_punct(text);
 
-    // Ligatures
     result = result
         .replace("``", "\u{201c}")
         .replace("''", "\u{201d}")
@@ -754,7 +748,6 @@ pub fn convert_symbols(text: &str) -> String {
         .replace("--", "\u{2013}")
         .replace('~', " ");
 
-    // Escaped characters
     result = result
         .replace("\\&", "&")
         .replace("\\#", "#")
@@ -762,7 +755,7 @@ pub fn convert_symbols(text: &str) -> String {
         .replace("\\%", "%")
         .replace("\\_", "_");
 
-    // Spacing symbols (punctuation-based, not word-boundary-safe for CommandReplacer)
+    // Spacing symbols are punctuation-based, not word-boundary-safe for CommandReplacer
     result = result
         .replace("\\,", "\u{2009}")
         .replace("\\;", "\u{205F}")
@@ -772,12 +765,10 @@ pub fn convert_symbols(text: &str) -> String {
     // Punctuation-style commands not handled by CommandReplacer boundary check
     result = result.replace("\\|", "\u{2016}");
 
-    // Command replacers (Aho-Corasick with word boundary)
     result = TEXT_COMMANDS.replace_all(&result);
     result = MATH_SYMBOLS.replace_all(&result);
     result = GREEK_LETTERS.replace_all(&result);
 
-    // Unicode math font converters
     result = convert_mathbb(&result);
     result = convert_mathcal_mathscr(&result);
     result = convert_mathfrak(&result);
@@ -800,11 +791,8 @@ mod tests {
     #[test]
     fn test_command_replacer_boundary() {
         let r = CommandReplacer::new(&[("\\in", "∈"), ("\\infty", "∞")]);
-        // \infty should match as a whole, not as \in + fty
         assert_eq!(r.replace_all("\\infty"), "∞");
-        // \in followed by non-alpha
         assert_eq!(r.replace_all("x \\in S"), "x ∈ S");
-        // \in followed by alpha (not via \infty) — should NOT match
         assert_eq!(r.replace_all("\\input"), "\\input");
     }
 
@@ -817,14 +805,12 @@ mod tests {
     #[test]
     fn test_command_replacer_followed_by_digit() {
         let r = CommandReplacer::new(&[("\\alpha", "α")]);
-        // Digits are not [a-zA-Z], so boundary check passes
         assert_eq!(r.replace_all("\\alpha123"), "α123");
     }
 
     #[test]
     fn test_command_replacer_followed_by_backslash() {
         let r = CommandReplacer::new(&[("\\alpha", "α"), ("\\beta", "β")]);
-        // \alpha followed by \beta — backslash is not [a-zA-Z], so \alpha matches
         assert_eq!(r.replace_all("\\alpha\\beta"), "αβ");
     }
 
@@ -984,7 +970,6 @@ mod tests {
     fn test_inverted_punct() {
         assert_eq!(convert_symbols("!`Hola"), "\u{00A1}Hola");
         assert_eq!(convert_symbols("?`Que"), "\u{00BF}Que");
-        // Double backtick should NOT be treated as inverted punct
         assert_eq!(convert_symbols("!``hello''"), "!\u{201c}hello\u{201d}");
     }
 

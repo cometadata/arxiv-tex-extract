@@ -3,9 +3,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
 
-/// Special character commands with braces (safe for literal replacement).
 static SPECIAL_CHARS_BRACED: &[(&str, &str)] = &[
-    // Cedilla
     (r"\c{c}", "ç"),
     (r"\c{C}", "Ç"),
     (r"\c{s}", "ş"),
@@ -33,11 +31,9 @@ static SPECIAL_CHARS_BRACED: &[(&str, &str)] = &[
     (r"\v{D}", "Ď"),
     (r"\v{t}", "ť"),
     (r"\v{T}", "Ť"),
-    // Dotless-i with caron
     (r"\v{\i}", "ǐ"),
 ];
 
-/// Special character commands without braces (need word boundary via Aho-Corasick).
 static SPECIAL_CHARS_BARE: LazyLock<CommandReplacer> = LazyLock::new(|| {
     CommandReplacer::new(&[
         ("\\ss", "ß"),
@@ -53,7 +49,6 @@ static SPECIAL_CHARS_BARE: LazyLock<CommandReplacer> = LazyLock::new(|| {
         ("\\L", "Ł"),
         ("\\i", "ı"),
         ("\\j", "ȷ"),
-        // Special Latin characters
         ("\\DJ", "Đ"),
         ("\\dj", "đ"),
         ("\\TH", "Þ"),
@@ -65,26 +60,23 @@ static SPECIAL_CHARS_BARE: LazyLock<CommandReplacer> = LazyLock::new(|| {
     ])
 });
 
-/// Combining diacritical marks.
 static DIACRITICS: &[(&str, char)] = &[
-    ("`", '\u{0300}'),  // grave
-    ("'", '\u{0301}'),  // acute
-    ("^", '\u{0302}'),  // circumflex
-    ("~", '\u{0303}'),  // tilde
-    ("=", '\u{0304}'),  // macron
-    (".", '\u{0307}'),  // dot above
-    ("\"", '\u{0308}'), // diaeresis
-    ("u", '\u{0306}'),  // breve
-    ("v", '\u{030C}'),  // caron
-    ("H", '\u{030B}'),  // double acute
-    ("r", '\u{030A}'),  // ring above
-    ("d", '\u{0323}'),  // dot below
-    ("b", '\u{0331}'),  // macron below
-    ("k", '\u{0328}'),  // ogonek
+    ("`", '\u{0300}'),
+    ("'", '\u{0301}'),
+    ("^", '\u{0302}'),
+    ("~", '\u{0303}'),
+    ("=", '\u{0304}'),
+    (".", '\u{0307}'),
+    ("\"", '\u{0308}'),
+    ("u", '\u{0306}'),
+    ("v", '\u{030C}'),
+    ("H", '\u{030B}'),
+    ("r", '\u{030A}'),
+    ("d", '\u{0323}'),
+    ("b", '\u{0331}'),
+    ("k", '\u{0328}'),
 ];
 
-/// Pre-compiled regex patterns for diacritics.
-/// Two forms: \accent{char} and \accent char (for single-letter accents).
 struct DiacriticPatterns {
     braced: Vec<(Regex, char)>,
     /// Bare patterns for punctuation-based accents (`` ` ' ^ ~ = . " ``).
@@ -144,7 +136,6 @@ fn convert_not_overlay(text: &str) -> String {
         result.push_str(&text[last_end..abs_pos]);
 
         if after < bytes.len() {
-            // Skip optional whitespace between \not and the next token
             let mut cursor = after;
             while cursor < bytes.len() && (bytes[cursor] == b' ' || bytes[cursor] == b'\t') {
                 cursor += 1;
@@ -152,10 +143,9 @@ fn convert_not_overlay(text: &str) -> String {
 
             if cursor < bytes.len() {
                 if bytes[cursor] == b'\\' {
-                    // \not\command — find the command end and apply overlay to first char of replacement
-                    // For text extraction, just skip the \not and leave the command as-is
-                    // (the command will be converted to its Unicode symbol later,
-                    //  and many negated forms already have dedicated commands like \neq, \notin)
+                    // \not\command: skip the \not and leave the command intact;
+                    // the command will be converted to its Unicode symbol later,
+                    // and many negated forms have dedicated commands (\neq, \notin).
                     last_end = after;
                 } else {
                     // \not followed by a single character: apply combining solidus
@@ -186,7 +176,7 @@ fn convert_not_overlay(text: &str) -> String {
 pub fn convert_diacritics(text: &str) -> String {
     let mut result = text.to_string();
 
-    // \not overlay: apply before symbol conversion so \not= etc. get combining mark
+    // Must apply \not overlay before symbol conversion so \not= etc. get combining mark
     result = convert_not_overlay(&result);
 
     for &(from, to) in SPECIAL_CHARS_BRACED {
@@ -330,9 +320,7 @@ mod tests {
     #[test]
     fn test_word_boundary() {
         // \oplus should NOT match \o + plus
-        // But Aho-Corasick checks the next char — if it's alpha, it skips
         let result = convert_diacritics(r"\oplus");
-        // \o should NOT match here because 'p' follows
         assert_eq!(result, r"\oplus");
     }
 
@@ -344,37 +332,29 @@ mod tests {
 
     #[test]
     fn test_bare_v_still_works() {
-        // Standalone \v{c} and \vc should still produce caron
         assert_eq!(convert_diacritics(r"\v{c}"), "č");
     }
 
     #[test]
     fn test_bare_accent_not_inside_command() {
-        // \vskip should NOT have \v match the 's'
-        // (even if strip_pre_diacritic_commands didn't run, boundary check protects)
         let result = convert_diacritics(r"\vskip");
         assert_eq!(result, r"\vskip");
     }
 
     #[test]
     fn test_bare_b_not_inside_command() {
-        // \baselineskip should NOT have \b match 'a'
         let result = convert_diacritics(r"\baselineskip");
         assert_eq!(result, r"\baselineskip");
     }
 
     #[test]
     fn test_bare_d_not_dots() {
-        // \dots should NOT have \d match 'o'
         let result = convert_diacritics(r"\dots");
         assert_eq!(result, r"\dots");
     }
 
     #[test]
     fn test_bare_r_not_rm_followed() {
-        // \rm followed by more text — \r should NOT match 'm' because 'm'
-        // is followed by another letter. (Standalone \rm at EOF relies on
-        // strip_pre_diacritic_commands removing it first.)
         let result = convert_diacritics(r"\rmfamily");
         assert_eq!(result, r"\rmfamily");
     }
@@ -413,7 +393,6 @@ mod tests {
 
     #[test]
     fn test_not_boundary() {
-        // \nothing should NOT match \not
         let result = convert_diacritics(r"\nothing");
         assert_eq!(result, r"\nothing");
     }

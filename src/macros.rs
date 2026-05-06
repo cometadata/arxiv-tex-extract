@@ -50,7 +50,6 @@ pub fn collect_macros(file_content: &str) -> HashMap<String, String> {
         while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
             pos += 1;
         }
-        // Skip macros that take arguments (detected by [n] arg-count specifier)
         if pos < bytes.len() && bytes[pos] == b'[' {
             continue;
         }
@@ -74,7 +73,6 @@ pub fn collect_macros(file_content: &str) -> HashMap<String, String> {
             pos += 1;
         }
 
-        // Skip \def macros with parameter patterns (#1, #2, etc.)
         if pos < bytes.len() && bytes[pos] == b'#' {
             continue;
         }
@@ -90,7 +88,6 @@ pub fn collect_macros(file_content: &str) -> HashMap<String, String> {
     macros
 }
 
-/// A macro defined with an argument count, e.g. `\newcommand{\foo}[2]{#1 and #2}`.
 pub struct ParametricMacro {
     pub name: String,
     pub num_args: usize,
@@ -121,7 +118,6 @@ pub fn collect_parametric_macros(file_content: &str) -> Vec<ParametricMacro> {
             pos += 1;
         }
 
-        // Must have [n] arg-count specifier (otherwise it's a simple macro)
         if pos >= bytes.len() || bytes[pos] != b'[' {
             continue;
         }
@@ -138,7 +134,6 @@ pub fn collect_parametric_macros(file_content: &str) -> Vec<ParametricMacro> {
                 pos += 1;
             }
 
-            // Check for optional default value [default]
             let optional_default = if pos < bytes.len() && bytes[pos] == b'[' {
                 if let Some((ds, de, after_default)) = extract_optional_arg(file_content, pos) {
                     pos = after_default;
@@ -163,7 +158,6 @@ pub fn collect_parametric_macros(file_content: &str) -> Vec<ParametricMacro> {
         }
     }
 
-    // Handle \def\foo#1#2{body}
     for cap in DEF_RE.find_iter(file_content) {
         let m = DEF_RE.captures(&file_content[cap.start()..]).unwrap();
         let name = m.get(1).unwrap().as_str().to_string();
@@ -179,7 +173,6 @@ pub fn collect_parametric_macros(file_content: &str) -> Vec<ParametricMacro> {
             pos += 1;
         }
 
-        // Must have #n parameter pattern (otherwise it's a simple macro)
         if pos >= bytes.len() || bytes[pos] != b'#' {
             continue;
         }
@@ -211,10 +204,9 @@ pub fn collect_parametric_macros(file_content: &str) -> Vec<ParametricMacro> {
     macros
 }
 
-/// Collect `\newtheorem{env_name}{Display Name}` definitions from the preamble.
-///
+/// Collect `\newtheorem{env_name}{Display Name}` definitions.
 /// Handles `\newtheorem*`, optional `[counter]` before the display name,
-/// and optional `[parent]` after. Returns `{env_name: Display Name}`.
+/// and optional `[parent]` after.
 pub fn collect_newtheorems(file_content: &str) -> HashMap<String, String> {
     let mut theorems = HashMap::new();
     let pattern = "\\newtheorem";
@@ -280,11 +272,9 @@ fn skip_ws_bytes(bytes: &[u8], pos: usize) -> usize {
     i
 }
 
-/// Normalize common shorthand environment abbreviations.
-///
-/// Some LaTeX documents define shortcuts like `\be` for `\begin{equation}`.
-/// This expands them before macro expansion to ensure they're properly
-/// processed. Uses CommandReplacer for word-boundary safety.
+/// Normalize common shorthand environment abbreviations like `\be` for
+/// `\begin{equation}`. Runs before macro expansion. Uses CommandReplacer for
+/// word-boundary safety.
 pub fn normalize_shorthands(text: &str) -> String {
     static SHORTHANDS: LazyLock<CommandReplacer> = LazyLock::new(|| {
         CommandReplacer::new(&[
@@ -303,8 +293,8 @@ pub fn normalize_shorthands(text: &str) -> String {
     SHORTHANDS.replace_all(text)
 }
 
-/// Size threshold (5MB) above which macro expansion uses fewer iterations
-/// to limit worst-case scanning on large inputs.
+/// Size threshold above which macro expansion uses fewer iterations to limit
+/// worst-case scanning on large inputs.
 const LARGE_INPUT_THRESHOLD: usize = 5_000_000;
 
 /// Abort macro expansion if cumulative output exceeds this multiple of the input.
@@ -320,16 +310,11 @@ const MAX_EXPANSION_GROWTH_RATIO: usize = 10;
 const MAX_EXPANSION_BYTES: usize = 50_000_000;
 
 /// Safely expand macros using Aho-Corasick single-pass replacement.
-///
-/// Iterates up to `max_passes` times to resolve multi-level macro chains
-/// (e.g. \foo -> \bar -> "final"). For inputs above 5MB, the cap is reduced
-/// from 5 to 3 passes to limit worst-case scanning.
+/// Iterates up to `max_passes` times to resolve multi-level macro chains.
 pub fn expand_macros(text: &str, macros: &HashMap<String, String>) -> String {
     expand_macros_cancellable(text, macros, None)
 }
 
-/// Cancellable variant of [`expand_macros`]. If `cancel` is `Some` and
-/// flips to `true` between passes, returns the last bounded buffer early.
 pub fn expand_macros_cancellable(
     text: &str,
     macros: &HashMap<String, String>,
@@ -396,14 +381,10 @@ pub fn expand_macros_cancellable(
 }
 
 /// Expand parametric macros by substituting `#1`, `#2`, etc. with extracted arguments.
-///
-/// Iterates up to 3 passes (2 for large inputs) to resolve nested parametric macros.
 pub fn expand_parametric_macros(text: &str, macros: &[ParametricMacro]) -> String {
     expand_parametric_macros_cancellable(text, macros, None)
 }
 
-/// Cancellable variant of [`expand_parametric_macros`]. Polls `cancel` at
-/// the top of each pass and between macros within a pass.
 pub fn expand_parametric_macros_cancellable(
     text: &str,
     macros: &[ParametricMacro],
@@ -467,7 +448,6 @@ pub fn expand_parametric_macros_cancellable(
     result
 }
 
-/// Expand all occurrences of a single parametric macro in the text.
 fn expand_single_parametric(text: &str, mac: &ParametricMacro) -> String {
     let name = &mac.name;
     let name_len = name.len();
@@ -478,21 +458,18 @@ fn expand_single_parametric(text: &str, mac: &ParametricMacro) -> String {
         let abs_pos = search_from + rel_pos;
         let after_name = abs_pos + name_len;
 
-        // Word boundary: next char must not be ASCII alphabetic
         if after_name < text.len() && text.as_bytes()[after_name].is_ascii_alphabetic() {
             out.push_str(&text[search_from..after_name]);
             search_from = after_name;
             continue;
         }
 
-        // Copy text before the match
         out.push_str(&text[search_from..abs_pos]);
 
         if let Some((replacement, new_cursor)) = try_expand_parametric(text, after_name, mac) {
             out.push_str(&replacement);
             search_from = new_cursor;
         } else {
-            // Could not extract required arguments; keep the command as-is
             out.push_str(name);
             search_from = after_name;
         }
@@ -502,10 +479,6 @@ fn expand_single_parametric(text: &str, mac: &ParametricMacro) -> String {
     out
 }
 
-/// Try to extract arguments and expand a single parametric macro invocation.
-///
-/// Returns `Some((replacement, cursor_after))` on success, or `None` if
-/// the required number of braced arguments could not be extracted.
 fn try_expand_parametric(
     text: &str,
     start: usize,
@@ -515,21 +488,18 @@ fn try_expand_parametric(
     let mut arg_values: Vec<String> = Vec::with_capacity(mac.num_args);
 
     if let Some(ref default) = mac.optional_default {
-        // First arg is optional with a default value
         if let Some((cs, ce, after)) = extract_optional_arg(text, cursor) {
             arg_values.push(text[cs..ce].to_string());
             cursor = after;
         } else {
             arg_values.push(default.clone());
         }
-        // Remaining args are mandatory
         for _ in 0..mac.num_args - 1 {
             let (cs, ce, after) = extract_command_arg(text, cursor)?;
             arg_values.push(text[cs..ce].to_string());
             cursor = after;
         }
     } else {
-        // All args are mandatory
         for _ in 0..mac.num_args {
             let (cs, ce, after) = extract_command_arg(text, cursor)?;
             arg_values.push(text[cs..ce].to_string());
@@ -542,9 +512,8 @@ fn try_expand_parametric(
 }
 
 /// Replace `#1`, `#2`, … placeholders in a macro body with argument values.
-///
-/// Handles `##` as an escaped literal `#`. All placeholders are substituted
-/// in a single pass to avoid interference between arguments.
+/// Handles `##` as an escaped literal `#`. Single pass to avoid interference
+/// between arguments.
 fn substitute_args(body: &str, args: &[String]) -> String {
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(body.len());
@@ -552,7 +521,6 @@ fn substitute_args(body: &str, args: &[String]) -> String {
     while i < bytes.len() {
         if bytes[i] == b'#' {
             if i + 1 >= bytes.len() {
-                // Trailing '#' with nothing after it — emit as literal
                 out.push('#');
                 i += 1;
             } else if bytes[i + 1] == b'#' {
@@ -563,7 +531,6 @@ fn substitute_args(body: &str, args: &[String]) -> String {
                 if n >= 1 && n <= args.len() {
                     out.push_str(&args[n - 1]);
                 }
-                // Out-of-range #N silently dropped (defensive for malformed macros)
                 i += 2;
             } else {
                 out.push('#');
@@ -647,7 +614,6 @@ mod tests {
     fn test_expand_macros_boundary() {
         let mut macros = HashMap::new();
         macros.insert("\\foo".to_string(), "bar".to_string());
-        // \foobar should NOT be expanded
         assert_eq!(expand_macros("\\foobar", &macros), "\\foobar");
     }
 
@@ -682,7 +648,6 @@ mod tests {
         macros.insert("\\bbb".to_string(), "\\ccc".to_string());
         macros.insert("\\ccc".to_string(), "done".to_string());
 
-        // Input above LARGE_INPUT_THRESHOLD still resolves a 3-level chain
         let mut large_input = "x".repeat(LARGE_INPUT_THRESHOLD + 1);
         large_input.push_str("\\aaa");
 
@@ -810,12 +775,10 @@ mod tests {
             body: "#1, #2!".into(),
             optional_default: Some("Hello".into()),
         }];
-        // Without optional arg: uses default
         assert_eq!(
             expand_parametric_macros("\\greet{World}", &macros),
             "Hello, World!"
         );
-        // With explicit optional arg
         assert_eq!(
             expand_parametric_macros("\\greet[Hi]{World}", &macros),
             "Hi, World!"
@@ -830,7 +793,6 @@ mod tests {
             body: "X".into(),
             optional_default: None,
         }];
-        // \foobar should NOT match \foo
         assert_eq!(
             expand_parametric_macros("\\foobar{x}", &macros),
             "\\foobar{x}"
@@ -845,7 +807,6 @@ mod tests {
             body: "#1".into(),
             optional_default: None,
         }];
-        // \foo without braced arg should be left as-is
         assert_eq!(
             expand_parametric_macros("\\foo is here", &macros),
             "\\foo is here"
@@ -918,7 +879,6 @@ mod tests {
 
     #[test]
     fn test_substitute_args_no_interference() {
-        // Ensure #2 in the value of #1 doesn't get substituted as arg 2
         let args = vec!["#2".to_string(), "real2".to_string()];
         let result = substitute_args("#1 and #2", &args);
         assert_eq!(result, "#2 and real2");
@@ -926,7 +886,6 @@ mod tests {
 
     #[test]
     fn test_substitute_args_trailing_hash() {
-        // Trailing '#' with nothing after it must not cause infinite loop
         let result = substitute_args("text#", &["arg1".to_string()]);
         assert_eq!(result, "text#");
     }
@@ -948,13 +907,11 @@ mod tests {
 
     #[test]
     fn test_normalize_shorthands_no_collision_begin() {
-        // \begin should NOT be affected by \be
         assert_eq!(normalize_shorthands("\\begin{document}"), "\\begin{document}");
     }
 
     #[test]
     fn test_normalize_shorthands_no_collision_beta() {
-        // \beta should NOT be affected by \be
         assert_eq!(normalize_shorthands("\\beta"), "\\beta");
     }
 

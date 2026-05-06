@@ -4,14 +4,10 @@ use regex::Regex;
 use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
 
-/// Commands that wrap content in emphasis: \emph{x} → *x*
 const EMPH_COMMANDS: &[&str] = &["emph", "textit", "textsl"];
 
-/// Commands that wrap content in bold: \textbf{x} → **x**
 const BOLD_COMMANDS: &[&str] = &["textbf", "mathbf", "boldsymbol", "bm"];
 
-/// Commands that unwrap to just their content: \textrm{x} → x
-///
 /// NOTE: math accents (hat, tilde, bar, vec, dot, ddot, acute, grave, check, breve,
 /// overline, underline) are handled by convert_math_accents() instead.
 /// Math font styles (mathcal, mathbb, mathfrak, mathsf, Bbb) are handled by
@@ -30,17 +26,13 @@ const UNWRAP_COMMANDS: &[&str] = &[
     "normalfont", "bfseries", "itshape",
     "Vert", "lVert", "rVert",
     "centering",
-    // soul package
     "uline", "uuline", "sout", "xout",
 ];
 
-/// Two-argument commands where we want the SECOND argument: \textcolor{red}{text} → text
 const TWO_ARG_SECOND: &[&str] = &["textcolor", "colorbox", "texorpdfstring"];
 
-/// Three-argument commands where we want the THIRD argument: \multicolumn{n}{align}{content} → content
 const THREE_ARG_THIRD: &[&str] = &["multicolumn"];
 
-/// Commands that extract content with spaces: \footnote{x} → " x "
 const INLINE_COMMANDS: &[&str] = &[
     "footnote", "footnotetext",
     "thanks",
@@ -50,18 +42,15 @@ const INLINE_COMMANDS: &[&str] = &[
     "endnote",
 ];
 
-/// Commands to strip entirely (cross-reference markers, etc.)
 const STRIP_COMMANDS: &[&str] = &[
     "corauthref", "fnref", "thanksref",
 ];
 
-/// Font size commands to remove
 const FONT_SIZE_COMMANDS: &[&str] = &[
     "tiny", "scriptsize", "footnotesize", "small", "normalsize",
     "large", "Large", "LARGE", "huge", "Huge",
 ];
 
-/// Commands that just a space before uppercase: \authornote → " "
 const SPACE_BEFORE_UPPER: &[&str] = &[
     "authornote", "email", "affiliation", "address",
     "institute", "institution", "cortext",
@@ -80,9 +69,8 @@ fn convert_inline_verb(text: &str) -> String {
 
     while let Some(pos) = text[search_start..].find("\\verb") {
         let abs_pos = search_start + pos;
-        let mut after = abs_pos + 5; // after "\verb"
+        let mut after = abs_pos + 5;
 
-        // Check for * variant
         if after < bytes.len() && bytes[after] == b'*' {
             after += 1;
         }
@@ -93,14 +81,13 @@ fn convert_inline_verb(text: &str) -> String {
             continue;
         }
 
-        // Next character is the delimiter (may be multi-byte UTF-8)
+        // Delimiter may be multi-byte UTF-8
         let Some(delim_char) = text[after..].chars().next() else {
             search_start = after;
             continue;
         };
         let content_start = after + delim_char.len_utf8();
 
-        // Find matching delimiter
         if let Some(end_offset) = text[content_start..].find(delim_char) {
             let content_end = content_start + end_offset;
             result.push_str(&text[last_end..abs_pos]);
@@ -138,7 +125,6 @@ fn convert_lstinline(text: &str) -> String {
             continue;
         }
 
-        // Braced form: \lstinline{...}
         if bytes[after] == b'{' {
             if let Some((cs, ce, after_close)) = extract_command_arg(text, after) {
                 result.push_str(&text[last_end..abs_pos]);
@@ -149,10 +135,8 @@ fn convert_lstinline(text: &str) -> String {
             }
         }
 
-        // Skip optional [options] arg
         let after_opt = skip_optional_arg(text, after);
 
-        // Delimiter form: \lstinline|...|
         if let Some(delim_char) = text[after_opt..].chars().next().filter(|&c| c != '{') {
             let content_start = after_opt + delim_char.len_utf8();
             if let Some(end_offset) = text[content_start..].find(delim_char) {
@@ -164,7 +148,6 @@ fn convert_lstinline(text: &str) -> String {
                 continue;
             }
         } else if after_opt < bytes.len() {
-            // Braced form after optional arg
             if let Some((cs, ce, after_close)) = extract_command_arg(text, after_opt) {
                 result.push_str(&text[last_end..abs_pos]);
                 result.push_str(&text[cs..ce]);
@@ -198,9 +181,7 @@ fn convert_mintinline(text: &str) -> String {
             continue;
         }
 
-        // Skip first arg (language)
         if let Some((_, _, after_first)) = extract_command_arg(text, after) {
-            // Extract second arg (code)
             if let Some((cs2, ce2, after_second)) = extract_command_arg(text, after_first) {
                 result.push_str(&text[last_end..abs_pos]);
                 result.push_str(&text[cs2..ce2]);
@@ -216,26 +197,23 @@ fn convert_mintinline(text: &str) -> String {
     result
 }
 
-/// Math accent commands mapped to their Unicode combining marks.
 const MATH_ACCENT_MAP: &[(&str, char)] = &[
-    ("hat",       '\u{0302}'), // COMBINING CIRCUMFLEX
-    ("tilde",     '\u{0303}'), // COMBINING TILDE
-    ("bar",       '\u{0305}'), // COMBINING OVERLINE
-    ("vec",       '\u{20D7}'), // COMBINING RIGHT ARROW ABOVE
-    ("dot",       '\u{0307}'), // COMBINING DOT ABOVE
-    ("ddot",      '\u{0308}'), // COMBINING DIAERESIS
-    ("acute",     '\u{0301}'), // COMBINING ACUTE
-    ("grave",     '\u{0300}'), // COMBINING GRAVE
-    ("check",     '\u{030C}'), // COMBINING CARON
-    ("breve",     '\u{0306}'), // COMBINING BREVE
-    ("overline",  '\u{0305}'), // COMBINING OVERLINE
-    ("underline", '\u{0332}'), // COMBINING LOW LINE
-    ("dddot",     '\u{20DB}'), // COMBINING THREE DOTS ABOVE
-    ("ddddot",    '\u{20DC}'), // COMBINING FOUR DOTS ABOVE
+    ("hat",       '\u{0302}'),
+    ("tilde",     '\u{0303}'),
+    ("bar",       '\u{0305}'),
+    ("vec",       '\u{20D7}'),
+    ("dot",       '\u{0307}'),
+    ("ddot",      '\u{0308}'),
+    ("acute",     '\u{0301}'),
+    ("grave",     '\u{0300}'),
+    ("check",     '\u{030C}'),
+    ("breve",     '\u{0306}'),
+    ("overline",  '\u{0305}'),
+    ("underline", '\u{0332}'),
+    ("dddot",     '\u{20DB}'),
+    ("ddddot",    '\u{20DC}'),
 ];
 
-/// Convert math accent commands to combining marks for single-char arguments,
-/// or plain unwrap for multi-char arguments.
 fn convert_math_accents(text: &str) -> String {
     let mut result = text.to_string();
     for &(cmd_name, combining) in MATH_ACCENT_MAP {
@@ -269,7 +247,6 @@ fn apply_math_accent(text: &str, cmd_name: &str, combining: char) -> String {
                 let composed = format!("{}{}", chars[0], combining);
                 result.push_str(&composed.nfc().collect::<String>());
             } else {
-                // Multi-character: fall back to plain unwrap
                 result.push_str(content);
             }
 
@@ -290,7 +267,6 @@ static FRAC_RE: LazyLock<Regex> =
 static BINOM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\(?:t|d)?binom").unwrap());
 
-/// Convert \frac{a}{b} → a/b outside math regions.
 fn convert_text_fractions(text: &str) -> String {
     let math_regions = find_math_regions(text);
     let mut result = String::with_capacity(text.len());
@@ -321,7 +297,6 @@ fn convert_text_fractions(text: &str) -> String {
     result
 }
 
-/// Convert \sqrt{x} → √(x) and \sqrt[n]{x} → √[n](x) outside math regions.
 fn convert_text_sqrt(text: &str) -> String {
     let math_regions = find_math_regions(text);
     let pattern = "\\sqrt";
@@ -378,7 +353,6 @@ fn convert_text_sqrt(text: &str) -> String {
     result
 }
 
-/// Convert \binom{n}{k} → C(n,k) outside math regions.
 fn convert_text_binom(text: &str) -> String {
     let math_regions = find_math_regions(text);
     let mut result = String::with_capacity(text.len());
@@ -415,12 +389,12 @@ fn convert_text_binom(text: &str) -> String {
 pub fn convert_formatting(text: &str) -> String {
     let mut result = text.to_string();
 
-    // Inline verbatim: extract before any other processing
+    // Inline verbatim must be extracted before any other processing
     result = convert_inline_verb(&result);
     result = convert_lstinline(&result);
     result = convert_mintinline(&result);
 
-    // Math accents: apply combining marks before generic unwrap
+    // Math accents must apply combining marks before generic unwrap
     result = convert_math_accents(&result);
 
     for cmd in EMPH_COMMANDS {
@@ -443,7 +417,6 @@ pub fn convert_formatting(text: &str) -> String {
         result = replace_three_arg_command(&result, cmd);
     }
 
-    // Math expression conversions (outside math regions only)
     result = convert_text_fractions(&result);
     result = convert_text_sqrt(&result);
     result = convert_text_binom(&result);
@@ -466,10 +439,9 @@ pub fn convert_formatting(text: &str) -> String {
 
     result = replace_with_unicode_script(&result, "textsuperscript", true);
     result = replace_with_unicode_script(&result, "textsubscript", false);
-    // Note: \inst{N} is handled in structure.rs (convert_institute_and_inst)
+    // \inst{N} is handled in structure.rs (convert_institute_and_inst)
     // where it has access to the \institute label→index mapping.
 
-    // Quantum notation (Dirac bra-ket)
     result = convert_quantum_notation(&result);
 
     for cmd in SPACE_BEFORE_UPPER {
@@ -501,10 +473,9 @@ fn replace_with_unicode_script(text: &str, cmd_name: &str, is_super: bool) -> St
         if let Some((cs, ce, after_close)) = extract_command_arg(text, after) {
             result.push_str(&text[last_end..abs_pos]);
             let content = &text[cs..ce];
-            // Only convert to Unicode super/subscript if content is
-            // digits, commas, spaces, hyphens, or symbols with mappings.
-            // Otherwise fall back to plain unwrap (e.g. \inst{\ref{...}}
-            // where \ref resolved to a label key rather than a number).
+            // Only convert if content is digits/symbols with known mappings;
+            // otherwise plain unwrap (e.g. \inst{\ref{...}} where \ref
+            // resolved to a label key rather than a number).
             let convertible = content
                 .chars()
                 .all(|c| c.is_ascii_digit() || c == ',' || c == ' ' || c == '-'
@@ -550,7 +521,7 @@ pub fn to_unicode_script(ch: char, is_super: bool) -> char {
             ')' => '\u{207E}',
             'n' => '\u{207F}',
             'i' => '\u{2071}',
-            '*' => '\u{2217}', // asterisk operator
+            '*' => '\u{2217}',
             _ => ch,
         }
     } else {
@@ -575,8 +546,6 @@ pub fn to_unicode_script(ch: char, is_super: bool) -> char {
     }
 }
 
-/// Replace `\cmd{content}` with `prefix` + content + `suffix`.
-/// Uses find_braced_group for arbitrarily nested content.
 fn replace_single_arg_command(text: &str, cmd_name: &str, prefix: &str, suffix: &str) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());
@@ -616,7 +585,6 @@ fn replace_single_arg_command(text: &str, cmd_name: &str, prefix: &str, suffix: 
     result
 }
 
-/// Replace `\cmd{arg1}{arg2}` with arg2 (extracts second argument).
 fn replace_two_arg_command(text: &str, cmd_name: &str) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());
@@ -653,7 +621,6 @@ fn replace_two_arg_command(text: &str, cmd_name: &str) -> String {
     result
 }
 
-/// Replace `\cmd{arg1}{arg2}{arg3}` with arg3 (extracts third argument).
 fn replace_three_arg_command(text: &str, cmd_name: &str) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());
@@ -692,7 +659,6 @@ fn replace_three_arg_command(text: &str, cmd_name: &str) -> String {
     result
 }
 
-/// Remove a standalone command like `\large` (no braces, just the command).
 fn remove_standalone_command(text: &str, cmd_name: &str) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());
@@ -718,7 +684,6 @@ fn remove_standalone_command(text: &str, cmd_name: &str) -> String {
     result
 }
 
-/// Strip `\cmd{arg}` entirely (command + braced arg → nothing).
 fn strip_command_entirely(text: &str, cmd_name: &str) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());
@@ -752,18 +717,16 @@ fn strip_command_entirely(text: &str, cmd_name: &str) -> String {
 fn convert_quantum_notation(text: &str) -> String {
     let mut result = text.to_string();
 
-    // Two-argument commands first (longer patterns matched first)
+    // Two-argument commands must be matched first (longer patterns first)
     result = convert_braket(&result);
     result = convert_ketbra(&result);
 
-    // Single-argument commands
     result = replace_single_arg_command(&result, "ket", "|\u{200B}", "\u{27E9}");
     result = replace_single_arg_command(&result, "bra", "\u{27E8}", "|\u{200B}");
 
     result
 }
 
-/// \braket{x}{y} → ⟨x|y⟩
 fn convert_braket(text: &str) -> String {
     let pattern = "\\braket";
     let mut result = String::with_capacity(text.len());
@@ -808,7 +771,6 @@ fn convert_braket(text: &str) -> String {
     result
 }
 
-/// \ketbra{x}{y} → |x⟩⟨y|
 fn convert_ketbra(text: &str) -> String {
     let pattern = "\\ketbra";
     let mut result = String::with_capacity(text.len());
@@ -846,7 +808,6 @@ fn convert_ketbra(text: &str) -> String {
     result
 }
 
-/// Replace `\cmd` followed by uppercase letter with a space.
 fn replace_cmd_before_upper(text: &str, cmd_name: &str) -> String {
     let pattern = format!("\\{}", cmd_name);
     let mut result = String::with_capacity(text.len());

@@ -2,27 +2,22 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-/// A .tex file with its name and content.
 #[derive(Debug, Clone)]
 pub struct TexFile {
     pub name: String,
     pub content: String,
 }
 
-/// Single-argument include commands: \input, \include, \subfile, \@input
 static INPUT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\(?:input|include|subfile|@input)\s*\{([^{}]+)\}").unwrap());
 
-/// \InputIfFileExists{file}{true-code}{false-code} — extract filename from first arg
 static INPUTIFFILEEXISTS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\\InputIfFileExists\s*\{([^{}]+)\}\{[^{}]*\}\{[^{}]*\}").unwrap()
 });
 
-/// \import{dir}{file} and \subimport{dir}{file} — two-arg form
 static IMPORT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\(?:sub)?import\s*\{([^{}]*)\}\s*\{([^{}]+)\}").unwrap());
 
-/// \bibliography{name} — resolve to name.bbl
 static BIBLIOGRAPHY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\\bibliography\s*\{([^{}]+)\}").unwrap());
 
@@ -80,7 +75,6 @@ pub fn resolve_inputs(
     result
 }
 
-/// Collect all include-like directives from content, returning (start, end, resolved_path).
 fn find_all_includes(content: &str) -> Vec<(usize, usize, String)> {
     let mut matches = Vec::new();
 
@@ -127,7 +121,7 @@ fn resolve_inputs_recursive(
 
     let matches = find_all_includes(content);
 
-    // Process in reverse order to preserve positions
+    // Reverse iteration preserves positions during in-place replacement
     for (start, end, path) in matches.into_iter().rev() {
         let resolved_path = resolve_path(&path);
 
@@ -155,9 +149,6 @@ fn resolve_inputs_recursive(
     }
 }
 
-/// Resolve a file path by normalizing:
-/// - Strip leading `./`
-/// - Append `.tex` if no known extension is already present
 fn resolve_path(path: &str) -> String {
     let trimmed = path.trim();
     let stripped = trimmed.strip_prefix("./").unwrap_or(trimmed);
@@ -208,8 +199,8 @@ pub fn build_file_index(files: &[TexFile]) -> HashMap<String, String> {
     index
 }
 
-/// Determine which files are referenced by `\input`/`\include` from the main file.
-/// Returns the set of file names that are included (and should NOT be processed standalone).
+/// Returns the set of file names referenced by `\input`/`\include` from the main file.
+/// Files in this set should NOT be processed standalone.
 pub fn find_included_files(main_content: &str, file_index: &HashMap<String, String>) -> HashSet<String> {
     let mut included = HashSet::new();
     collect_included_recursive(main_content, file_index, &mut included, &mut HashSet::new(), 0, 20);
@@ -370,7 +361,6 @@ mod tests {
         index.insert("a.tex".into(), r"\input{b}".into());
         index.insert("b.tex".into(), r"\input{a}".into());
         let content = r"\input{a}";
-        // Should not loop forever
         let resolved = resolve_inputs(content, &index, 20);
         assert!(resolved.contains("\\input{a}") || resolved.contains("\\input{b}") || !resolved.is_empty());
     }
@@ -382,7 +372,6 @@ mod tests {
             index.insert(format!("f{}.tex", i), format!("\\input{{f{}}}", i + 1));
         }
         let content = r"\input{f0}";
-        // Should stop at depth 20
         let resolved = resolve_inputs(content, &index, 20);
         assert!(!resolved.is_empty());
     }
@@ -406,7 +395,7 @@ mod tests {
             TexFile { name: "standalone.tex".into(), content: "Standalone content".into() },
         ];
         let result = resolve_and_order(&files);
-        assert_eq!(result.len(), 2); // main (with intro inlined) + standalone
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0].name, "main.tex");
         assert!(result[0].content.contains("Introduction"));
         assert_eq!(result[1].name, "standalone.tex");
@@ -528,7 +517,6 @@ mod tests {
             },
         ];
         let result = resolve_and_order(&files);
-        // main + appendix, but NOT the template
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|f| f.name != "iclr2025_conference.tex"));
     }
